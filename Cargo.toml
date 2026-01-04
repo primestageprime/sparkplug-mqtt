@@ -1,0 +1,28 @@
+[package]
+name = "sparkplug-mqtt"
+version = "0.1.0"
+edition = "2024"
+description = "SparkPlug B protocol client for MQTT — connect, publish, and subscribe to industrial IoT metrics"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/primestageprime/sparkplug-mqtt"
+keywords = ["mqtt", "sparkplug", "iot", "industrial", "scada"]
+categories = ["network-programming"]
+rust-version = "1.85"
+
+[dependencies]
+rumqttc = { version = "0.25.1", features = ["use-rustls"] }
+prost = "0.14.1"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+rustls = "0.23.32"
+rustls-native-certs = "0.8.3"
+tracing = "0.1.44"
+thiserror = "2.0.17"
+rand = "0.9.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = "0.3"
+
+[build-dependencies]
+prost-build = "0.14.1"
+protoc-bin-vendored = "3.0.0"
