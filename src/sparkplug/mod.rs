@@ -11,6 +11,4 @@ pub use payload_helpers::{
 #[allow(deprecated)]
 pub use publisher::SparkplugPublisher;
 pub use topic::parse_sparkplug_topic;
-pub use types::{
-    MessageType, MetricValue, SparkplugTopic, Timestamp, TimestampToMetrics, VERSION,
-};
+pub use types::{MessageType, MetricValue, SparkplugTopic, Timestamp, TimestampToMetrics, VERSION};

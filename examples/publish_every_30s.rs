@@ -5,7 +5,7 @@
 //!
 //! Requires an MQTT broker running on localhost:1883.
 
-use sparkplug_mqtt::{MqttConfig, MetricValue, SparkplugClient};
+use sparkplug_mqtt::{MetricValue, MqttConfig, SparkplugClient};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[tokio::main]

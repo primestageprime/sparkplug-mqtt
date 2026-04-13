@@ -1,10 +1,12 @@
 use crate::client::MqttClient;
 use crate::error::SparkplugError;
-use crate::payload::payload::{metric, Metric};
+use crate::payload::payload::{Metric, metric};
 use prost::Message;
 use std::sync::Arc;
 
-use super::payload_helpers::{create_birth_certificate, create_device_birth_certificate, create_payload};
+use super::payload_helpers::{
+    create_birth_certificate, create_device_birth_certificate, create_payload,
+};
 use super::types::TimestampToMetrics;
 
 // ---------------------------------------------------------------------------

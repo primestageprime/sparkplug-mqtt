@@ -36,7 +36,9 @@ pub fn tls_transport() -> Result<Transport, SparkplugError> {
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    Ok(Transport::Tls(TlsConfiguration::Rustls(Arc::new(client_config))))
+    Ok(Transport::Tls(TlsConfiguration::Rustls(Arc::new(
+        client_config,
+    ))))
 }
 
 pub type MessageCallback = Box<dyn Fn(String, Vec<u8>) + Send + Sync>;
@@ -137,10 +139,7 @@ impl MqttClientManager {
             loop {
                 match eventloop.poll().await {
                     Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
-                        tracing::info!(
-                            "MQTT client connected for group {}",
-                            group_id_for_task
-                        );
+                        tracing::info!("MQTT client connected for group {}", group_id_for_task);
                         consecutive_errors = 0;
                         // Signal that we're connected
                         if let Some(tx) = tx_clone.lock().await.take() {
@@ -148,10 +147,7 @@ impl MqttClientManager {
                         }
                     }
                     Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect)) => {
-                        tracing::warn!(
-                            "MQTT client disconnected for group {}",
-                            group_id_for_task
-                        );
+                        tracing::warn!("MQTT client disconnected for group {}", group_id_for_task);
                     }
                     Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
                         consecutive_errors = 0;
@@ -200,10 +196,7 @@ impl MqttClientManager {
         let timeout_duration = Duration::from_secs(5);
         match tokio::time::timeout(timeout_duration, rx).await {
             Ok(_) => {
-                tracing::info!(
-                    "MQTT client connected successfully for group {}",
-                    group_id
-                );
+                tracing::info!("MQTT client connected successfully for group {}", group_id);
             }
             Err(_) => {
                 handle.abort();
@@ -224,8 +217,7 @@ impl MqttClientManager {
 impl MqttClient {
     pub fn new(config: MqttConfig) -> (Self, EventLoop) {
         let client_id = generate_client_id(&config);
-        let mut mqtt_options =
-            MqttOptions::new(client_id, &config.broker_url, config.broker_port);
+        let mut mqtt_options = MqttOptions::new(client_id, &config.broker_url, config.broker_port);
 
         mqtt_options.set_credentials(&config.username, &config.password);
 
@@ -327,7 +319,10 @@ mod tests {
         };
         let id = generate_client_id(&config);
         assert!(id.starts_with("spBv1.0_MyGroup_node1_"));
-        let suffix: &str = id.rsplit('_').next().expect("client ID should contain underscores");
+        let suffix: &str = id
+            .rsplit('_')
+            .next()
+            .expect("client ID should contain underscores");
         let num: u16 = suffix.parse().expect("suffix should be a number");
         assert!((1000..=9999).contains(&num));
     }
