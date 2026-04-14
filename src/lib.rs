@@ -24,7 +24,7 @@
 //! let client = SparkplugClient::connect(&config).await?;
 //! client.publish_birth("MyGroup", "device1").await?;
 //! client
-//!     .publish_metric("MyGroup", "device1", "temperature", MetricValue::Float(23.5), 0)
+//!     .publish_metric("MyGroup", "node1", "device1", "temperature", MetricValue::Float(23.5), 0)
 //!     .await?;
 //! # Ok(())
 //! # }

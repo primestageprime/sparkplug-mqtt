@@ -37,6 +37,7 @@ async fn main() -> Result<(), sparkplug_mqtt::SparkplugError> {
         client
             .publish_metric(
                 "Example",
+                "example-node",
                 "sensor1",
                 "temperature",
                 MetricValue::Float(20.0 + rand::random::<f64>() * 10.0),
