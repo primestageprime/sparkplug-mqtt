@@ -38,11 +38,15 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 /// let client = SparkplugClient::connect(&config).await?;
 /// client.publish_birth("MyGroup", "device1").await?;
 /// client
-///     .publish_metric("MyGroup", "device1", "temperature", MetricValue::Float(23.5), 0)
+///     .publish_metric("MyGroup", "node1", "device1", "temperature", MetricValue::Float(23.5), 0)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// The `node_id` parameter on `publish_metric`/`publish_metrics` is explicit
+/// so a single client can publish on behalf of multiple Sparkplug edge nodes
+/// (e.g. one connection, many assets).
 pub struct SparkplugClient {
     client: rumqttc::AsyncClient,
     version: Arc<str>,
@@ -134,10 +138,17 @@ impl SparkplugClient {
         })
     }
 
-    /// Publish a single metric as a DDATA message.
+    /// Publish a single metric as a DDATA message on behalf of `node_id`.
+    ///
+    /// The Sparkplug topic is `{version}/{group_id}/DDATA/{node_id}/{device_id}`,
+    /// so the caller controls the edge-node identity per publish. A single
+    /// client can therefore publish as many different edge nodes — useful when
+    /// a back-end service injects historical or synthetic metrics on behalf of
+    /// multiple assets.
     pub async fn publish_metric(
         &self,
         group_id: &str,
+        node_id: &str,
         device_id: &str,
         metric_name: &str,
         value: MetricValue,
@@ -153,10 +164,7 @@ impl SparkplugClient {
         };
 
         let payload = create_payload(vec![metric], Some(Timestamp(timestamp_ms)));
-        let topic = format!(
-            "{}/{}/DDATA/{}/{}",
-            self.version, group_id, self.node_id, device_id
-        );
+        let topic = ddata_topic(&self.version, group_id, node_id, device_id);
 
         self.client
             .publish(
@@ -169,10 +177,11 @@ impl SparkplugClient {
         Ok(())
     }
 
-    /// Publish a batch of metrics as a single DDATA message.
+    /// Publish a batch of metrics as a single DDATA message on behalf of `node_id`.
     pub async fn publish_metrics(
         &self,
         group_id: &str,
+        node_id: &str,
         device_id: &str,
         metrics: Vec<(String, MetricValue, u64)>,
     ) -> Result<(), SparkplugError> {
@@ -191,10 +200,7 @@ impl SparkplugClient {
             .collect();
 
         let payload = create_payload(proto_metrics, None);
-        let topic = format!(
-            "{}/{}/DDATA/{}/{}",
-            self.version, group_id, self.node_id, device_id
-        );
+        let topic = ddata_topic(&self.version, group_id, node_id, device_id);
 
         self.client
             .publish(
@@ -241,5 +247,32 @@ impl SparkplugClient {
             .await?;
 
         Ok(())
+    }
+}
+
+/// Build the DDATA topic for a metric publish.
+///
+/// Extracted as a pure function so callers can assert the topic shape in
+/// tests without needing an MQTT broker.
+fn ddata_topic(version: &str, group_id: &str, node_id: &str, device_id: &str) -> String {
+    format!("{version}/{group_id}/DDATA/{node_id}/{device_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ddata_topic;
+
+    #[test]
+    fn ddata_topic_uses_caller_provided_node_id() {
+        let topic = ddata_topic("spBv1.0", "Stax", "xbox7-1", "xbox7-1");
+        assert_eq!(topic, "spBv1.0/Stax/DDATA/xbox7-1/xbox7-1");
+    }
+
+    #[test]
+    fn ddata_topic_distinguishes_node_and_device() {
+        // Real deployments usually set node_id == device_id for single-asset
+        // nodes, but the topic must carry both independently.
+        let topic = ddata_topic("spBv1.0", "Stax", "edge-node-A", "device-1");
+        assert_eq!(topic, "spBv1.0/Stax/DDATA/edge-node-A/device-1");
     }
 }
