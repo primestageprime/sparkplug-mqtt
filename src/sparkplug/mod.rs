@@ -1,10 +1,14 @@
 mod client;
+mod delivery;
+mod eventloop;
 mod payload_helpers;
 mod publisher;
 mod topic;
 mod types;
 
 pub use client::SparkplugClient;
+pub use delivery::{DeliveryTracker, PublishTicket};
+pub use eventloop::Health;
 pub use payload_helpers::{
     create_birth_certificate, create_device_birth_certificate, create_metric, create_payload,
 };

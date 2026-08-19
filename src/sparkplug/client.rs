@@ -6,13 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+use super::delivery::DeliveryTracker;
+use super::eventloop::Health;
 use super::payload_helpers::{
     create_birth_certificate, create_device_birth_certificate, create_payload,
 };
 use super::types::{MetricValue, Timestamp};
-
-/// Maximum consecutive event-loop errors before escalating from warn to error.
-const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
 /// A self-contained SparkPlug B client that owns an `AsyncClient` and a
 /// background event loop.
@@ -51,6 +50,8 @@ pub struct SparkplugClient {
     client: rumqttc::AsyncClient,
     version: Arc<str>,
     node_id: Arc<str>,
+    delivery: Arc<DeliveryTracker>,
+    health: tokio::sync::watch::Sender<Health>,
     event_loop_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -71,62 +72,45 @@ impl SparkplugClient {
     /// Returns [`SparkplugError::ConnectionTimeout`] if the broker doesn't
     /// respond within 5 seconds.
     pub async fn connect(config: &MqttConfig) -> Result<Self, SparkplugError> {
-        let (mqtt_client, mut eventloop) = MqttClient::new(config.clone());
+        Self::connect_with_timeout(config, DEFAULT_CONNECT_TIMEOUT).await
+    }
+
+    /// Connect, waiting up to `timeout` for the broker to answer.
+    ///
+    /// [`Self::connect`] uses five seconds. Raise it when the broker may be
+    /// restarting alongside this process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparkplugError::ConnectionTimeout`] if the broker does not
+    /// answer within `timeout`.
+    pub async fn connect_with_timeout(
+        config: &MqttConfig,
+        timeout: Duration,
+    ) -> Result<Self, SparkplugError> {
+        let (mqtt_client, eventloop) = MqttClient::new(config.clone());
         let async_client = mqtt_client.into_async_client();
 
         let version: Arc<str> = Arc::from(config.version.as_str());
         let node_id: Arc<str> = Arc::from(config.node_id.as_str());
 
         let (tx, rx) = oneshot::channel::<()>();
-        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+        let delivery = Arc::new(DeliveryTracker::new());
+        let (health, _) = tokio::sync::watch::channel(Health::Disconnected);
+        let event_loop_handle = tokio::spawn(super::eventloop::run(
+            eventloop,
+            delivery.clone(),
+            health.clone(),
+            tx,
+        ));
 
-        let tx_clone = tx.clone();
-        let event_loop_handle = tokio::spawn(async move {
-            let mut consecutive_errors: u32 = 0;
-            loop {
-                match eventloop.poll().await {
-                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
-                        tracing::info!("SparkplugClient connected");
-                        consecutive_errors = 0;
-                        if let Some(tx) = tx_clone.lock().await.take() {
-                            let _ = tx.send(());
-                        }
-                    }
-                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect)) => {
-                        tracing::warn!("SparkplugClient disconnected");
-                    }
-                    Ok(_) => {
-                        consecutive_errors = 0;
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                            tracing::error!(
-                                "SparkplugClient event loop error ({} consecutive): {}",
-                                consecutive_errors,
-                                e
-                            );
-                        } else {
-                            tracing::warn!(
-                                "SparkplugClient event loop error ({} consecutive): {}",
-                                consecutive_errors,
-                                e
-                            );
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        });
-
-        let timeout_duration = Duration::from_secs(5);
-        match tokio::time::timeout(timeout_duration, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(_) => {
                 tracing::info!("SparkplugClient connected successfully");
             }
             Err(_) => {
                 event_loop_handle.abort();
-                return Err(SparkplugError::ConnectionTimeout(timeout_duration));
+                return Err(SparkplugError::ConnectionTimeout(timeout));
             }
         }
 
@@ -134,6 +118,8 @@ impl SparkplugClient {
             client: async_client,
             version,
             node_id,
+            delivery,
+            health,
             event_loop_handle,
         })
     }
@@ -145,6 +131,19 @@ impl SparkplugClient {
     /// client can therefore publish as many different edge nodes — useful when
     /// a back-end service injects historical or synthetic metrics on behalf of
     /// multiple assets.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is not cancel-safe. It counts the publish before it hands
+    /// the message to the client, and it holds that count across an `await`.
+    /// A cancelled call drops the count without a rollback. `unacked` then
+    /// stays one too high until the next disconnect, so every later
+    /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
+    ///
+    /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
+    /// publish in a `select!` branch that another branch can cancel. Publish
+    /// the whole batch, then bound the wait with the `timeout` argument of
+    /// [`Self::flush`].
     pub async fn publish_metric(
         &self,
         group_id: &str,
@@ -166,18 +165,23 @@ impl SparkplugClient {
         let payload = create_payload(vec![metric], Some(Timestamp(timestamp_ms)));
         let topic = ddata_topic(&self.version, group_id, node_id, device_id);
 
-        self.client
-            .publish(
-                &topic,
-                rumqttc::QoS::AtLeastOnce,
-                false,
-                payload.encode_to_vec(),
-            )
-            .await?;
-        Ok(())
+        self.publish_tracked(&topic, payload.encode_to_vec()).await
     }
 
     /// Publish a batch of metrics as a single DDATA message on behalf of `node_id`.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is not cancel-safe. It counts the publish before it hands
+    /// the message to the client, and it holds that count across an `await`.
+    /// A cancelled call drops the count without a rollback. `unacked` then
+    /// stays one too high until the next disconnect, so every later
+    /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
+    ///
+    /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
+    /// publish in a `select!` branch that another branch can cancel. Publish
+    /// the whole batch, then bound the wait with the `timeout` argument of
+    /// [`Self::flush`].
     pub async fn publish_metrics(
         &self,
         group_id: &str,
@@ -202,18 +206,23 @@ impl SparkplugClient {
         let payload = create_payload(proto_metrics, None);
         let topic = ddata_topic(&self.version, group_id, node_id, device_id);
 
-        self.client
-            .publish(
-                &topic,
-                rumqttc::QoS::AtLeastOnce,
-                false,
-                payload.encode_to_vec(),
-            )
-            .await?;
-        Ok(())
+        self.publish_tracked(&topic, payload.encode_to_vec()).await
     }
 
     /// Publish NBIRTH + DBIRTH for a device.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is not cancel-safe. It counts the publish before it hands
+    /// the message to the client, and it holds that count across an `await`.
+    /// A cancelled call drops the count without a rollback. `unacked` then
+    /// stays one too high until the next disconnect, so every later
+    /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
+    ///
+    /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
+    /// publish in a `select!` branch that another branch can cancel. Publish
+    /// the whole batch, then bound the wait with the `timeout` argument of
+    /// [`Self::flush`].
     pub async fn publish_birth(
         &self,
         group_id: &str,
@@ -222,13 +231,7 @@ impl SparkplugClient {
         // NBIRTH
         let nbirth_topic = format!("{}/{}/NBIRTH/{}", self.version, group_id, self.node_id);
         let nbirth_payload = create_birth_certificate();
-        self.client
-            .publish(
-                &nbirth_topic,
-                rumqttc::QoS::AtLeastOnce,
-                false,
-                nbirth_payload.encode_to_vec(),
-            )
+        self.publish_tracked(&nbirth_topic, nbirth_payload.encode_to_vec())
             .await?;
 
         // DBIRTH
@@ -237,16 +240,192 @@ impl SparkplugClient {
             self.version, group_id, self.node_id, device_id
         );
         let dbirth_payload = create_device_birth_certificate();
-        self.client
-            .publish(
-                &dbirth_topic,
-                rumqttc::QoS::AtLeastOnce,
-                false,
-                dbirth_payload.encode_to_vec(),
-            )
-            .await?;
+        self.publish_tracked(&dbirth_topic, dbirth_payload.encode_to_vec())
+            .await
+    }
 
-        Ok(())
+    /// Publish one QoS 1 message and keep the delivery count honest.
+    ///
+    /// This is not cancel-safe. A cancelled call leaves `unacked` one too
+    /// high, so every later flush reports `FlushTimeout`.
+    async fn publish_tracked(&self, topic: &str, payload: Vec<u8>) -> Result<(), SparkplugError> {
+        record_around_publish(
+            &self.delivery,
+            self.client
+                .publish(topic, rumqttc::QoS::AtLeastOnce, false, payload),
+        )
+        .await
+    }
+
+    /// Wait until the broker has acknowledged every publish from this client.
+    ///
+    /// Call this before recording that a message was delivered — for example
+    /// before stamping a database row as published, or before a short-lived
+    /// process exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparkplugError::PublishLost`] when a disconnect discarded
+    /// publishes since the last flush. Sparkplug requires `clean_session`, so
+    /// the broker keeps no session state and those messages cannot be resent
+    /// automatically. Returns [`SparkplugError::FlushTimeout`] when the broker
+    /// stays silent.
+    ///
+    /// A successful flush clears the loss record, so each call reports only
+    /// what happened since the previous one.
+    pub async fn flush(&self, timeout: Duration) -> Result<(), SparkplugError> {
+        self.delivery.flush(timeout).await
+    }
+
+    /// How many publishes the broker has not acknowledged yet.
+    #[must_use]
+    pub fn unacked(&self) -> u32 {
+        self.delivery.unacked()
+    }
+
+    /// Watch whether the client holds a broker connection.
+    ///
+    /// This reports the link only. A `Connected` reading does not prove that
+    /// any particular message arrived — use [`Self::flush`] for that.
+    #[must_use]
+    pub fn health(&self) -> tokio::sync::watch::Receiver<Health> {
+        self.health.subscribe()
+    }
+
+    /// Flush, disconnect cleanly, and stop the event loop.
+    ///
+    /// Prefer this to dropping the client. [`Drop`] aborts the event loop
+    /// immediately, so a short-lived process can lose whatever had not reached
+    /// the wire.
+    ///
+    /// `timeout` bounds the whole sequence, not each step. The flush runs
+    /// first and can use the full budget, which leaves the disconnect
+    /// unconfirmed. This method never runs past `timeout` by more than the
+    /// time one lock takes.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::flush`] returns. Returns
+    /// [`SparkplugError::Disconnect`] when the client refuses the DISCONNECT
+    /// request, and [`SparkplugError::ShutdownTimeout`] when the flush
+    /// succeeds but the event loop does not confirm the DISCONNECT packet
+    /// before the deadline. The client stops on any of these errors, so the
+    /// caller learns what happened without leaking the task.
+    pub async fn shutdown(self, timeout: Duration) -> Result<(), SparkplugError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let flushed = self.flush(timeout).await;
+
+        // Subscribe before the request, so the signal cannot slip past.
+        let health = self.health.subscribe();
+        let requested = tokio::time::timeout_at(deadline, self.client.disconnect()).await;
+
+        shutdown_outcome(
+            flushed,
+            disconnect_outcome(requested, health, deadline).await,
+            timeout,
+        )
+    }
+}
+
+/// How long [`SparkplugClient::connect`] waits for the broker to answer.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wait until the event loop reports the link is down, or `deadline` passes.
+///
+/// The loop sets [`Health::Disconnected`] once it writes the DISCONNECT
+/// packet, so this waits on the packet rather than on a fixed delay.
+/// Returns `false` when the deadline arrives first, which means the packet
+/// is unconfirmed. A link that is already down reports `true` at once,
+/// because a dead link needs no DISCONNECT.
+async fn wait_for_disconnect(
+    mut health: tokio::sync::watch::Receiver<Health>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let down = health.wait_for(|state| *state == Health::Disconnected);
+    tokio::time::timeout_at(deadline, down)
+        .await
+        .is_ok_and(|state| state.is_ok())
+}
+
+/// What [`SparkplugClient::shutdown`] learns from its DISCONNECT attempt.
+#[derive(Debug)]
+enum Disconnected {
+    /// The event loop wrote the DISCONNECT packet.
+    Written,
+    /// The deadline arrived before the event loop confirmed the packet.
+    Unconfirmed,
+    /// The client refused the request, so no packet can go out.
+    Refused(rumqttc::ClientError),
+}
+
+/// Read the DISCONNECT request, then wait for the event loop to write it.
+///
+/// `requested` holds `Err` when the deadline beat the request, `Ok(Err)`
+/// when the client refused it, and `Ok(Ok)` when the request went through.
+async fn disconnect_outcome(
+    requested: Result<Result<(), rumqttc::ClientError>, tokio::time::error::Elapsed>,
+    health: tokio::sync::watch::Receiver<Health>,
+    deadline: tokio::time::Instant,
+) -> Disconnected {
+    match requested {
+        Err(_elapsed) => Disconnected::Unconfirmed,
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "the client refused the DISCONNECT request");
+            Disconnected::Refused(error)
+        }
+        Ok(Ok(())) => match wait_for_disconnect(health, deadline).await {
+            true => Disconnected::Written,
+            false => Disconnected::Unconfirmed,
+        },
+    }
+}
+
+/// Choose what [`SparkplugClient::shutdown`] reports.
+///
+/// A lost publish outranks a failed DISCONNECT, because the caller must
+/// publish those messages again. A refusal outranks the deadline, because
+/// it names the cause instead of the symptom.
+fn shutdown_outcome(
+    flushed: Result<(), SparkplugError>,
+    disconnected: Disconnected,
+    timeout: Duration,
+) -> Result<(), SparkplugError> {
+    match (flushed, disconnected) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Disconnected::Written) => Ok(()),
+        (Ok(()), Disconnected::Refused(error)) => Err(SparkplugError::Disconnect(error)),
+        (Ok(()), Disconnected::Unconfirmed) => {
+            Err(SparkplugError::ShutdownTimeout { after: timeout })
+        }
+    }
+}
+
+/// Count a publish, hand it to the client, then roll the count back when
+/// the client refuses it.
+///
+/// The count must rise before `publish` runs. `publish_metric` and `flush`
+/// both take `&self`, so a task that shares this client can flush while a
+/// publish is still in flight. A disconnect in that window would record no
+/// loss, and an early PubAck would leave a count that never clears.
+/// Over-counting only delays a flush, so it is the safe direction.
+///
+/// The rollback carries the ticket from the matching `record_publish`, so a
+/// refusal can never cancel a count that a disconnect cleared or that
+/// belongs to a publish from another task.
+///
+/// Split out as a free function so a test can drive the ordering without a
+/// broker.
+async fn record_around_publish(
+    delivery: &DeliveryTracker,
+    publish: impl Future<Output = Result<(), rumqttc::ClientError>>,
+) -> Result<(), SparkplugError> {
+    let ticket = delivery.record_publish();
+    match publish.await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            delivery.record_publish_failed(ticket);
+            Err(SparkplugError::from(error))
+        }
     }
 }
 
@@ -259,20 +438,4 @@ fn ddata_topic(version: &str, group_id: &str, node_id: &str, device_id: &str) ->
 }
 
 #[cfg(test)]
-mod tests {
-    use super::ddata_topic;
-
-    #[test]
-    fn ddata_topic_uses_caller_provided_node_id() {
-        let topic = ddata_topic("spBv1.0", "Stax", "xbox7-1", "xbox7-1");
-        assert_eq!(topic, "spBv1.0/Stax/DDATA/xbox7-1/xbox7-1");
-    }
-
-    #[test]
-    fn ddata_topic_distinguishes_node_and_device() {
-        // Real deployments usually set node_id == device_id for single-asset
-        // nodes, but the topic must carry both independently.
-        let topic = ddata_topic("spBv1.0", "Stax", "edge-node-A", "device-1");
-        assert_eq!(topic, "spBv1.0/Stax/DDATA/edge-node-A/device-1");
-    }
-}
+mod tests;

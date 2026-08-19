@@ -46,9 +46,10 @@ pub use payload::{
 };
 #[allow(deprecated)]
 pub use sparkplug::{
-    MessageType, MetricValue, SparkplugClient, SparkplugPublisher, SparkplugTopic, Timestamp,
-    TimestampToMetrics, VERSION, create_birth_certificate, create_device_birth_certificate,
-    create_metric, create_payload, parse_sparkplug_topic,
+    DeliveryTracker, Health, MessageType, MetricValue, PublishTicket, SparkplugClient,
+    SparkplugPublisher, SparkplugTopic, Timestamp, TimestampToMetrics, VERSION,
+    create_birth_certificate, create_device_birth_certificate, create_metric, create_payload,
+    parse_sparkplug_topic,
 };
 
 // Re-export rumqttc types for convenience

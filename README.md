@@ -58,6 +58,39 @@ async fn main() -> Result<(), sparkplug_mqtt::SparkplugError> {
 - **Robust event loop** — automatic reconnection with backoff on errors
 - **Async/await** — built on tokio and rumqttc
 
+## Confirming delivery
+
+`publish_metric` returns when the message enters the internal queue, not when
+the broker has it. Call `flush` before you record the message as delivered.
+
+```rust
+for row in rows {
+    client.publish_metric(&group, &node, &device, &row.name, row.value, row.ts).await?;
+}
+
+// Only record the rows as published once the broker has them.
+match client.flush(Duration::from_secs(5)).await {
+    Ok(()) => mark_published(&rows).await?,
+    Err(e) => tracing::warn!("not recording as published: {e}"),
+}
+```
+
+The publish methods are not cancel-safe. A cancelled publish leaves `unacked`
+one too high, so every later `flush` reports `SparkplugError::FlushTimeout`.
+Only a disconnect clears that count. Do not wrap one publish in
+`tokio::time::timeout`. Do not put one publish in a `select!` branch that
+another branch can cancel. Apply the deadline around the whole batch, and use
+the `timeout` argument of `flush`.
+
+Call `client.shutdown(Duration::from_secs(5))` before a short-lived process
+exits. `shutdown` flushes, sends a DISCONNECT, and then stops the event loop.
+A plain drop aborts the event loop at once, so the last messages can go
+missing. The timeout bounds the whole sequence. `shutdown` waits for the
+event loop to write the DISCONNECT packet, and reports
+`SparkplugError::ShutdownTimeout` when it cannot confirm the packet in time.
+`shutdown` reports `SparkplugError::Disconnect` when the client refuses the
+DISCONNECT request, which names the cause instead of the deadline.
+
 ## Architecture
 
 | Module | Purpose |
@@ -69,7 +102,7 @@ async fn main() -> Result<(), sparkplug_mqtt::SparkplugError> {
 
 ## Known Limitations
 
-- **No connection health signal.** `publish()` enqueues messages into an internal buffer and returns `Ok(())` even if the MQTT connection is currently down. The background event loop will retry delivery, but there is no way for callers to detect a permanently broken connection. A health-check mechanism (e.g., a `watch` channel) is planned for a future release.
+- **A publish is not a delivery.** `publish_metric` and `publish_metrics` put the message in an internal queue and return `Ok(())`, even when the connection is down. Call `flush(timeout)` to wait until the broker acknowledges every message. Call `shutdown(timeout)` to drain the queue before a short-lived process exits. Sparkplug needs `clean_session = true`, so a disconnect discards the queued messages. `flush` reports that loss as `SparkplugError::PublishLost` instead of hiding it. Use `health()` to watch the link state.
 - **Sequence numbers are hardcoded.** The SparkPlug B spec requires `seq` to increment 0-255. This crate currently hardcodes `seq` to 0 (births) or 1 (data). A proper sequence counter is planned for a future release.
 
 ## License
