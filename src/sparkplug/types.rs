@@ -3,8 +3,6 @@ use crate::payload::encode_type;
 use crate::payload::payload::metric;
 use std::str::FromStr;
 
-pub const VERSION: &str = "spBv1.0";
-
 // ---------------------------------------------------------------------------
 // MetricValue
 // ---------------------------------------------------------------------------
@@ -35,20 +33,27 @@ impl MetricValue {
 }
 
 // ---------------------------------------------------------------------------
-// SparkplugTopic / MessageType
+// Shape / MessageType
 // ---------------------------------------------------------------------------
 
-/// Parsed SparkplugB topic information
-#[derive(Debug, Clone, PartialEq)]
-pub struct SparkplugTopic {
-    pub group_id: String,
-    pub node_id: String,
-    pub device_id: Option<String>,
-    pub message_type: MessageType,
+/// Which segment layout a topic uses.
+///
+/// The message type fixes the shape, so a caller never chooses one. Match on
+/// [`super::SparkplugTopic::shape`] to learn which identity accessors carry a
+/// value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Shape {
+    /// `{namespace}/{group}/{type}/{node}`
+    Node,
+    /// `{namespace}/{group}/{type}/{node}/{device}`
+    Device,
+    /// `{namespace}/STATE/{host}`
+    Host,
 }
 
 /// SparkplugB message types
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MessageType {
     NBIRTH, // Node birth
@@ -76,6 +81,42 @@ impl MessageType {
             MessageType::DCMD => "DCMD",
             MessageType::STATE => "STATE",
         }
+    }
+
+    /// Which topic shape this message type requires.
+    #[must_use]
+    pub fn shape(&self) -> Shape {
+        match self {
+            MessageType::NBIRTH | MessageType::NDATA | MessageType::NDEATH | MessageType::NCMD => {
+                Shape::Node
+            }
+            MessageType::DBIRTH | MessageType::DDATA | MessageType::DDEATH | MessageType::DCMD => {
+                Shape::Device
+            }
+            MessageType::STATE => Shape::Host,
+        }
+    }
+
+    /// The QoS the Sparkplug specification fixes for this message type.
+    ///
+    /// This states the specification. It does not state what this crate
+    /// sends — a client that publishes on behalf of edge nodes it does not
+    /// own may keep QoS 1 so its callers can confirm delivery.
+    #[must_use]
+    pub fn spec_qos(&self) -> rumqttc::QoS {
+        match self {
+            MessageType::NDEATH | MessageType::STATE => rumqttc::QoS::AtLeastOnce,
+            _ => rumqttc::QoS::AtMostOnce,
+        }
+    }
+
+    /// Whether the Sparkplug specification retains this message type.
+    ///
+    /// Only STATE is retained, so a host application that connects later
+    /// still learns whether the primary host is online.
+    #[must_use]
+    pub fn spec_retain(&self) -> bool {
+        matches!(self, MessageType::STATE)
     }
 }
 
@@ -105,7 +146,7 @@ impl std::fmt::Display for MessageType {
 }
 
 // ---------------------------------------------------------------------------
-// Timestamp / TimestampToMetrics
+// Timestamp
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,31 +159,21 @@ impl Timestamp {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TimestampToMetrics {
-    timestamp: Timestamp,
-    metrics: Vec<crate::payload::payload::Metric>,
-}
-
-impl TimestampToMetrics {
-    pub fn new(timestamp: Timestamp, metrics: Vec<crate::payload::payload::Metric>) -> Self {
-        Self { timestamp, metrics }
-    }
-
-    #[must_use]
-    pub fn timestamp(&self) -> Timestamp {
-        self.timestamp
-    }
-
-    #[must_use]
-    pub fn metrics(&self) -> &[crate::payload::payload::Metric] {
-        &self.metrics
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALL: [MessageType; 9] = [
+        MessageType::NBIRTH,
+        MessageType::NDATA,
+        MessageType::NDEATH,
+        MessageType::DBIRTH,
+        MessageType::DDATA,
+        MessageType::DDEATH,
+        MessageType::NCMD,
+        MessageType::DCMD,
+        MessageType::STATE,
+    ];
 
     #[test]
     fn message_type_from_str() {
@@ -152,21 +183,60 @@ mod tests {
 
     #[test]
     fn message_type_roundtrip() {
-        let all = [
+        for mt in &ALL {
+            let parsed: MessageType = mt.as_str().parse().expect("roundtrip should succeed");
+            assert_eq!(&parsed, mt);
+        }
+    }
+
+    #[test]
+    fn node_messages_take_the_node_shape() {
+        for mt in [
             MessageType::NBIRTH,
             MessageType::NDATA,
             MessageType::NDEATH,
+            MessageType::NCMD,
+        ] {
+            assert_eq!(mt.shape(), Shape::Node, "{mt} is a node message");
+        }
+    }
+
+    #[test]
+    fn device_messages_take_the_device_shape() {
+        for mt in [
             MessageType::DBIRTH,
             MessageType::DDATA,
             MessageType::DDEATH,
-            MessageType::NCMD,
             MessageType::DCMD,
-            MessageType::STATE,
-        ];
-        for mt in &all {
-            let s = mt.as_str();
-            let parsed: MessageType = s.parse().expect("roundtrip should succeed");
-            assert_eq!(&parsed, mt);
+        ] {
+            assert_eq!(mt.shape(), Shape::Device, "{mt} is a device message");
+        }
+    }
+
+    #[test]
+    fn state_takes_the_host_shape() {
+        assert_eq!(MessageType::STATE.shape(), Shape::Host);
+    }
+
+    #[test]
+    fn only_ndeath_and_state_use_qos_one() {
+        for mt in ALL {
+            let expected = match mt {
+                MessageType::NDEATH | MessageType::STATE => rumqttc::QoS::AtLeastOnce,
+                _ => rumqttc::QoS::AtMostOnce,
+            };
+            assert_eq!(mt.spec_qos(), expected, "{mt} carries the wrong spec QoS");
+        }
+    }
+
+    #[test]
+    fn only_state_is_retained() {
+        for mt in ALL {
+            assert_eq!(
+                mt.spec_retain(),
+                mt == MessageType::STATE,
+                "{mt} carries the wrong spec retain flag"
+            );
         }
     }
 }

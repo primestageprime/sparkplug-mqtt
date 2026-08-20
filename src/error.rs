@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::sparkplug::MessageType;
+
 /// Errors that can occur when using sparkplug-mqtt.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +36,25 @@ pub enum SparkplugError {
     /// The message type segment of a topic is not a known SparkPlug B type.
     #[error("unknown message type: {0}")]
     UnknownMessageType(String),
+
+    /// The namespace cannot be used as a topic segment.
+    ///
+    /// A namespace must be non-empty and must not contain `/`, `+` or `#`.
+    #[error("invalid namespace: {0}")]
+    InvalidNamespace(String),
+
+    /// The topic names a known message type, but its segments do not match
+    /// the shape that message type requires.
+    ///
+    /// A node message carries a group and an edge node. A device message adds
+    /// a device. A STATE message carries a host id alone. This is a
+    /// well-formed topic from a publisher that addressed it wrongly, which is
+    /// why it does not report as [`Self::InvalidTopic`].
+    #[error("topic {topic} has the wrong shape for a {message_type} message")]
+    WrongTopicShape {
+        topic: String,
+        message_type: MessageType,
+    },
 
     /// A disconnect discarded publishes the broker never acknowledged.
     ///

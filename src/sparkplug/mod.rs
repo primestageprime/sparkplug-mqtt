@@ -1,18 +1,17 @@
 mod client;
 mod delivery;
 mod eventloop;
+mod ids;
 mod payload_helpers;
-mod publisher;
 mod topic;
 mod types;
 
 pub use client::SparkplugClient;
 pub use delivery::{DeliveryTracker, PublishTicket};
 pub use eventloop::Health;
+pub use ids::{DeviceId, EdgeNodeId, GroupId, HostId};
 pub use payload_helpers::{
     create_birth_certificate, create_device_birth_certificate, create_metric, create_payload,
 };
-#[allow(deprecated)]
-pub use publisher::SparkplugPublisher;
-pub use topic::parse_sparkplug_topic;
-pub use types::{MessageType, MetricValue, SparkplugTopic, Timestamp, TimestampToMetrics, VERSION};
+pub use topic::{Namespace, SparkplugTopic};
+pub use types::{MessageType, MetricValue, Shape, Timestamp};

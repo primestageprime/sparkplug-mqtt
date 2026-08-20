@@ -3,6 +3,7 @@
 //! They live in their own file so `client.rs` stays under the
 //! module size limit.
 
+use super::shutdown::{Disconnected, disconnect_outcome, shutdown_outcome, wait_for_disconnect};
 use super::*;
 
 #[tokio::test]
@@ -154,15 +155,35 @@ fn shutdown_reports_success_once_the_disconnect_is_written() {
 }
 
 #[test]
-fn ddata_topic_uses_caller_provided_node_id() {
-    let topic = ddata_topic("spBv1.0", "Stax", "xbox7-1", "xbox7-1");
-    assert_eq!(topic, "spBv1.0/Stax/DDATA/xbox7-1/xbox7-1");
+fn the_batch_mapping_keeps_each_metric_name_value_and_timestamp() {
+    let mapped = proto_metrics(vec![
+        ("temperature".to_string(), MetricValue::Float(23.5), 100),
+        ("mode".to_string(), MetricValue::String("AUTO".into()), 200),
+    ]);
+
+    assert_eq!(mapped.len(), 2);
+    assert_eq!(mapped[0].name.as_deref(), Some("temperature"));
+    assert_eq!(mapped[0].timestamp, Some(100));
+    assert_eq!(mapped[1].name.as_deref(), Some("mode"));
+    assert_eq!(mapped[1].timestamp, Some(200));
 }
 
 #[test]
-fn ddata_topic_distinguishes_node_and_device() {
-    // Real deployments usually set node_id == device_id for single-asset
-    // nodes, but the topic must carry both independently.
-    let topic = ddata_topic("spBv1.0", "Stax", "edge-node-A", "device-1");
-    assert_eq!(topic, "spBv1.0/Stax/DDATA/edge-node-A/device-1");
+fn a_checked_identifier_cannot_reach_the_wrong_segment() {
+    // The types are the guard. This records what the topic looks like when
+    // the edge node and the device differ, which is the pair a caller used
+    // to be able to swap silently.
+    let ns = Namespace::sparkplug_b();
+    let topic = ns.ddata(
+        GroupId::new("Stax").expect("Stax is a usable group id"),
+        EdgeNodeId::new("edge-node-A").expect("usable edge node id"),
+        DeviceId::new("device-1").expect("usable device id"),
+    );
+    assert_eq!(topic.to_string(), "spBv1.0/Stax/DDATA/edge-node-A/device-1");
+}
+
+#[test]
+fn a_bad_namespace_fails_the_connect_rather_than_every_publish() {
+    let err = Namespace::new("spB/v1.0").expect_err("a namespace with a slash addresses nothing");
+    assert!(matches!(err, SparkplugError::InvalidNamespace(_)));
 }

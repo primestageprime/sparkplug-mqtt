@@ -1,4 +1,9 @@
 //! The background MQTT poll loop.
+//!
+//! The loop reads one event at a time from an [`EventSource`] and applies it
+//! to the delivery tracker and the health signal. `rumqttc::EventLoop` is the
+//! adapter in production. Tests supply a scripted adapter, so the whole
+//! session lifecycle runs without a broker.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,10 +15,27 @@ use super::delivery::DeliveryTracker;
 /// Maximum consecutive event-loop errors before escalating from warn to error.
 const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
-/// Apply one polled event to the delivery tracker.
+/// How long the loop waits after a poll error before it polls again.
+const ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
+/// A stream of MQTT events the loop can poll.
 ///
-/// Split out as a pure function so the classification is testable without
-/// a broker.
+/// This is the seam under [`run`]. `rumqttc::EventLoop` satisfies it in
+/// production; a scripted adapter satisfies it in tests. The `Send` bound is
+/// what lets [`super::SparkplugClient::connect`] spawn the loop.
+pub(super) trait EventSource {
+    fn poll(
+        &mut self,
+    ) -> impl Future<Output = Result<rumqttc::Event, rumqttc::ConnectionError>> + Send;
+}
+
+impl EventSource for rumqttc::EventLoop {
+    async fn poll(&mut self) -> Result<rumqttc::Event, rumqttc::ConnectionError> {
+        rumqttc::EventLoop::poll(self).await
+    }
+}
+
+/// Apply one polled event to the delivery tracker.
 fn apply_event(
     delivery: &DeliveryTracker,
     event: &Result<rumqttc::Event, rumqttc::ConnectionError>,
@@ -58,9 +80,12 @@ fn apply_health(
     health.send_replace(next);
 }
 
-/// Poll the MQTT event loop until the task is aborted.
-pub(super) async fn run(
-    mut eventloop: rumqttc::EventLoop,
+/// Poll the event source until the task is aborted.
+///
+/// The loop never returns on its own. A poll error is not fatal — it backs
+/// off and polls again, because `rumqttc` reconnects underneath.
+pub(super) async fn run<S: EventSource>(
+    mut source: S,
     delivery: Arc<DeliveryTracker>,
     health: tokio::sync::watch::Sender<Health>,
     ready: oneshot::Sender<()>,
@@ -69,7 +94,7 @@ pub(super) async fn run(
     let mut consecutive_errors: u32 = 0;
 
     loop {
-        let event = eventloop.poll().await;
+        let event = source.poll().await;
         apply_event(&delivery, &event);
         apply_health(&health, &event);
 
@@ -102,96 +127,11 @@ pub(super) async fn run(
                         e
                     );
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(ERROR_BACKOFF).await;
             }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_puback_clears_one_publish() {
-        let tracker = DeliveryTracker::new();
-        let _ticket = tracker.record_publish();
-        apply_event(
-            &tracker,
-            &Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(
-                rumqttc::PubAck::new(1),
-            ))),
-        );
-        assert_eq!(tracker.unacked(), 0);
-    }
-
-    #[test]
-    fn a_poll_error_loses_everything_outstanding() {
-        let tracker = DeliveryTracker::new();
-        let _ticket = tracker.record_publish();
-        apply_event(&tracker, &Err(rumqttc::ConnectionError::RequestsDone));
-        assert_eq!(
-            tracker.unacked(),
-            0,
-            "a disconnect clears the outstanding count"
-        );
-    }
-
-    #[test]
-    fn an_incoming_disconnect_loses_everything_outstanding() {
-        let tracker = DeliveryTracker::new();
-        let _ticket = tracker.record_publish();
-        apply_event(
-            &tracker,
-            &Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect)),
-        );
-        assert_eq!(tracker.unacked(), 0);
-    }
-
-    #[test]
-    fn an_unrelated_event_changes_nothing() {
-        let tracker = DeliveryTracker::new();
-        let _ticket = tracker.record_publish();
-        apply_event(
-            &tracker,
-            &Ok(rumqttc::Event::Incoming(rumqttc::Packet::PingResp)),
-        );
-        assert_eq!(tracker.unacked(), 1);
-    }
-
-    #[test]
-    fn connack_reports_connected_and_errors_report_disconnected() {
-        let (tx, rx) = tokio::sync::watch::channel(Health::Disconnected);
-
-        apply_health(
-            &tx,
-            &Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(
-                rumqttc::ConnAck::new(rumqttc::ConnectReturnCode::Success, false),
-            ))),
-        );
-        assert_eq!(*rx.borrow(), Health::Connected);
-
-        apply_health(&tx, &Err(rumqttc::ConnectionError::RequestsDone));
-        assert_eq!(*rx.borrow(), Health::Disconnected);
-    }
-
-    #[test]
-    fn a_written_disconnect_reports_disconnected() {
-        let (tx, rx) = tokio::sync::watch::channel(Health::Connected);
-        apply_health(
-            &tx,
-            &Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::Disconnect)),
-        );
-        assert_eq!(*rx.borrow(), Health::Disconnected);
-    }
-
-    #[test]
-    fn an_unrelated_event_leaves_health_alone() {
-        let (tx, rx) = tokio::sync::watch::channel(Health::Connected);
-        apply_health(
-            &tx,
-            &Ok(rumqttc::Event::Incoming(rumqttc::Packet::PingResp)),
-        );
-        assert_eq!(*rx.borrow(), Health::Connected);
-    }
-}
+mod tests;

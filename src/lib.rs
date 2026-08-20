@@ -38,18 +38,16 @@ pub mod sparkplug;
 pub mod util;
 
 // Re-export commonly used types
-pub use client::{MqttClient, MqttClientManager, MqttConfig, tls_transport};
+pub use client::{MqttConfig, generate_client_id, mqtt_options, mqtt_parts, tls_transport};
 pub use error::SparkplugError;
 pub use payload::{
     Metric, Payload, decode_metric_value_to_string, decode_payload, decode_type, encode_type,
     metric,
 };
-#[allow(deprecated)]
 pub use sparkplug::{
-    DeliveryTracker, Health, MessageType, MetricValue, PublishTicket, SparkplugClient,
-    SparkplugPublisher, SparkplugTopic, Timestamp, TimestampToMetrics, VERSION,
+    DeliveryTracker, DeviceId, EdgeNodeId, GroupId, Health, HostId, MessageType, MetricValue,
+    Namespace, PublishTicket, Shape, SparkplugClient, SparkplugTopic, Timestamp,
     create_birth_certificate, create_device_birth_certificate, create_metric, create_payload,
-    parse_sparkplug_topic,
 };
 
 // Re-export rumqttc types for convenience

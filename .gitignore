@@ -1,4 +1,6 @@
 /target
 
 # Internal notes. Do not ship these files.
-docs/
+docs/*
+# Decision records travel with the repo.
+!docs/adr/

@@ -6,7 +6,7 @@ SparkPlug B protocol client for MQTT — connect, publish, and subscribe to indu
 
 ```toml
 [dependencies]
-sparkplug-mqtt = "0.1"
+sparkplug-mqtt = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 ```
 
@@ -35,7 +35,10 @@ async fn main() -> Result<(), sparkplug_mqtt::SparkplugError> {
 
     loop {
         client.publish_metric(
-            "Plant1", "pump1", "temperature",
+            "Plant1",       // group
+            "edge1",        // edge node
+            "pump1",        // device
+            "temperature",  // metric
             MetricValue::Float(42.5),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -51,12 +54,43 @@ async fn main() -> Result<(), sparkplug_mqtt::SparkplugError> {
 ## Features
 
 - **SparkPlug B protocol** — full protobuf encoding/decoding per the Eclipse SparkPlug B spec
-- **Topic parsing** — parse and construct `spBv1.0/<group>/<type>/<node>[/<device>]` topics
+- **Topic namespace** — `Namespace` builds and parses every Sparkplug topic, including
+  the three-segment `spBv1.0/STATE/<host>` form. Parsing is strict: a topic addressed
+  with the wrong shape for its message type is reported, not reinterpreted
+- **Identifiers that cannot be swapped** — `GroupId`, `EdgeNodeId` and `DeviceId` are
+  checked once and are not interchangeable, so a transposed argument stops compiling
 - **Multiple metric types** — Float (f64), String, Bool, Int (u64)
-- **Connection pooling** — `MqttClientManager` maintains per-group client connections
+- **Delivery you can confirm** — `flush` waits for the broker and reports what a
+  reconnect discarded, instead of reporting an enqueued message as delivered
 - **TLS support** — `tls_transport()` loads system root certificates
 - **Robust event loop** — automatic reconnection with backoff on errors
 - **Async/await** — built on tokio and rumqttc
+
+## Publishing without transposing an identifier
+
+`publish_metric` takes four adjacent `&str`s — group, edge node, device, metric
+name. Nothing stops you passing them in the wrong order. The checked path does:
+
+```rust
+use sparkplug_mqtt::{GroupId, EdgeNodeId, DeviceId, MetricValue};
+
+// group is usually fixed for a batch, so check it once
+let group = GroupId::new("Plant1")?;
+
+for reading in readings {
+    let node = EdgeNodeId::new(&reading.asset_id)?;
+    let device = DeviceId::new(&reading.device_id)?;
+
+    let topic = client.namespace().ddata(group, node, device);
+    client
+        .publish_metric_to(&topic, "temperature", MetricValue::Float(reading.value), reading.ts)
+        .await?;
+}
+```
+
+`ddata` cannot fail — each identifier was checked when it was built — and it
+will not compile with its arguments transposed. The six-argument
+`publish_metric` still works and is not deprecated.
 
 ## Confirming delivery
 
@@ -95,8 +129,8 @@ DISCONNECT request, which names the cause instead of the deadline.
 
 | Module | Purpose |
 |--------|---------|
-| `client` | MQTT connection management and pooling |
-| `sparkplug` | SparkPlug B protocol types, topic parsing, `SparkplugClient` |
+| `client` | MQTT connection setup — options, transport, `mqtt_parts` |
+| `sparkplug` | SparkPlug B protocol types, the topic namespace, `SparkplugClient` |
 | `payload` | Protobuf message encoding/decoding (generated from `sparkplugb.proto`) |
 | `error` | `SparkplugError` — all error types in one enum |
 

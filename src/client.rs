@@ -1,10 +1,14 @@
+//! MQTT connection setup.
+//!
+//! This module owns the options a Sparkplug connection needs and hands back
+//! the two `rumqttc` halves. [`crate::SparkplugClient`] drives them for you.
+//! Call [`mqtt_parts`] directly only when you run your own event loop.
+
 use rumqttc::Transport;
-use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS, TlsConfiguration};
+use rumqttc::{AsyncClient, EventLoop, MqttOptions, TlsConfiguration};
 use rustls::ClientConfig;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 use crate::error::SparkplugError;
 
@@ -41,8 +45,6 @@ pub fn tls_transport() -> Result<Transport, SparkplugError> {
     ))))
 }
 
-pub type MessageCallback = Box<dyn Fn(String, Vec<u8>) + Send + Sync>;
-
 #[derive(Clone)]
 pub struct MqttConfig {
     pub broker_url: String,
@@ -50,7 +52,7 @@ pub struct MqttConfig {
     pub transport: Transport,
     pub username: String,
     pub password: String,
-    pub group_id: String, // default group id
+    pub group_id: String, // names the client id only; every publish takes its own
     pub node_id: String,
     pub version: String,
 }
@@ -70,6 +72,9 @@ impl std::fmt::Debug for MqttConfig {
 }
 
 /// Generate a client ID in the format `{version}_{group}_{node}_{random 1000–9999}`.
+///
+/// The random suffix keeps two connections from one process off the same
+/// client id, which a broker would treat as a takeover.
 #[must_use]
 pub fn generate_client_id(config: &MqttConfig) -> String {
     format!(
@@ -81,233 +86,50 @@ pub fn generate_client_id(config: &MqttConfig) -> String {
     )
 }
 
-/// Maximum consecutive event-loop errors before escalating from warn to error.
-const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+/// Build the MQTT options a Sparkplug connection needs.
+///
+/// `clean_session` is `true` because Sparkplug requires it. That setting is
+/// load-bearing: it is why a reconnect discards queued publishes, which is
+/// why [`crate::SparkplugClient::flush`] exists. Do not change it.
+///
+/// Split out from [`mqtt_parts`] so a test can read the settings back
+/// without opening a socket.
+#[must_use]
+pub fn mqtt_options(config: &MqttConfig) -> MqttOptions {
+    let client_id = generate_client_id(config);
+    let mut options = MqttOptions::new(client_id, &config.broker_url, config.broker_port);
 
-#[derive(Clone)]
-pub struct MqttClient {
-    client: Arc<AsyncClient>,
-    config: Arc<MqttConfig>,
-    message_callback: Arc<Mutex<Option<MessageCallback>>>,
+    options.set_credentials(&config.username, &config.password);
+    options.set_keep_alive(Duration::from_secs(15));
+    options.set_clean_session(true);
+    options.set_max_packet_size(10 * 1024 * 1024, 10 * 1024 * 1024);
+    options.set_inflight(100);
+    options.set_manual_acks(false);
+    options.set_pending_throttle(Duration::from_millis(100));
+    options.set_transport(config.transport.clone());
+
+    options
 }
 
-#[derive(Clone)]
-pub struct MqttClientManager {
-    clients: Arc<Mutex<HashMap<String, Arc<MqttClient>>>>,
-    base_config: MqttConfig,
-}
-
-impl MqttClientManager {
-    pub fn new(base_config: MqttConfig) -> Self {
-        Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-            base_config,
-        }
-    }
-
-    pub async fn get_or_create_client(
-        &self,
-        group_id: &str,
-    ) -> Result<Arc<MqttClient>, SparkplugError> {
-        let mut clients = self.clients.lock().await;
-
-        if let Some(client) = clients.get(group_id) {
-            return Ok(client.clone());
-        }
-
-        // Create new client for this group
-        let mut config = self.base_config.clone();
-        config.group_id = group_id.to_string();
-
-        let (client, mut eventloop) = MqttClient::new(config);
-        let client = Arc::new(client);
-
-        // Clone group_id for both the task and the HashMap insertion
-        let group_id_for_task = group_id.to_string();
-        let group_id_for_map = group_id.to_string();
-
-        // Create a channel to signal when the client is connected
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
-
-        // Spawn event loop for this client
-        let tx_clone = tx.clone();
-        let client_for_messages = client.clone();
-        let handle = tokio::spawn(async move {
-            tracing::info!("Starting MQTT event loop for group {}", group_id_for_task);
-            let mut consecutive_errors: u32 = 0;
-            loop {
-                match eventloop.poll().await {
-                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
-                        tracing::info!("MQTT client connected for group {}", group_id_for_task);
-                        consecutive_errors = 0;
-                        // Signal that we're connected
-                        if let Some(tx) = tx_clone.lock().await.take() {
-                            let _ = tx.send(());
-                        }
-                    }
-                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::Disconnect)) => {
-                        tracing::warn!("MQTT client disconnected for group {}", group_id_for_task);
-                    }
-                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
-                        consecutive_errors = 0;
-                        tracing::debug!(
-                            "Received MQTT message on topic: {} ({} bytes)",
-                            publish.topic,
-                            publish.payload.len()
-                        );
-
-                        // Call the message callback if set
-                        if let Some(ref callback) =
-                            *client_for_messages.message_callback.lock().await
-                        {
-                            callback(publish.topic, publish.payload.to_vec());
-                        }
-                    }
-                    Ok(_) => {
-                        consecutive_errors = 0;
-                        continue;
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                            tracing::error!(
-                                "MQTT event loop error for group {} ({} consecutive): {}",
-                                group_id_for_task,
-                                consecutive_errors,
-                                e
-                            );
-                        } else {
-                            tracing::warn!(
-                                "MQTT event loop error for group {} ({} consecutive): {}",
-                                group_id_for_task,
-                                consecutive_errors,
-                                e
-                            );
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                }
-            }
-        });
-
-        // Wait for initial connection with timeout
-        let timeout_duration = Duration::from_secs(5);
-        match tokio::time::timeout(timeout_duration, rx).await {
-            Ok(_) => {
-                tracing::info!("MQTT client connected successfully for group {}", group_id);
-            }
-            Err(_) => {
-                handle.abort();
-                return Err(SparkplugError::ConnectionTimeout(timeout_duration));
-            }
-        }
-
-        clients.insert(group_id_for_map, client.clone());
-        Ok(client)
-    }
-
-    pub async fn remove_client(&self, group_id: &str) {
-        let mut clients = self.clients.lock().await;
-        clients.remove(group_id);
-    }
-}
-
-impl MqttClient {
-    pub fn new(config: MqttConfig) -> (Self, EventLoop) {
-        let client_id = generate_client_id(&config);
-        let mut mqtt_options = MqttOptions::new(client_id, &config.broker_url, config.broker_port);
-
-        mqtt_options.set_credentials(&config.username, &config.password);
-
-        // Set MQTT options for better reliability
-        mqtt_options.set_keep_alive(Duration::from_secs(15));
-        mqtt_options.set_clean_session(true);
-        mqtt_options.set_max_packet_size(10 * 1024 * 1024, 10 * 1024 * 1024);
-        mqtt_options.set_inflight(100);
-        mqtt_options.set_manual_acks(false);
-        mqtt_options.set_pending_throttle(Duration::from_millis(100));
-
-        // Set up transport — rumqttc accepts any Transport variant directly
-        mqtt_options.set_transport(config.transport.clone());
-
-        let (client, eventloop) = AsyncClient::new(mqtt_options, 10);
-        let client = Arc::new(client);
-        let config = Arc::new(config);
-        let message_callback = Arc::new(Mutex::new(None));
-
-        (
-            Self {
-                client,
-                config,
-                message_callback,
-            },
-            eventloop,
-        )
-    }
-
-    pub async fn subscribe(&self, topic: &str) -> Result<(), SparkplugError> {
-        self.client.subscribe(topic, QoS::AtLeastOnce).await?;
-        Ok(())
-    }
-
-    pub async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), SparkplugError> {
-        self.client
-            .publish(topic, QoS::AtLeastOnce, false, payload.to_vec())
-            .await?;
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn version(&self) -> &str {
-        &self.config.version
-    }
-
-    #[must_use]
-    pub fn node_id(&self) -> &str {
-        &self.config.node_id
-    }
-
-    #[must_use]
-    pub fn config(&self) -> &MqttConfig {
-        &self.config
-    }
-
-    pub async fn set_message_callback(&self, callback: MessageCallback) {
-        *self.message_callback.lock().await = Some(callback);
-    }
-
-    /// Consume this client wrapper and return the underlying `AsyncClient`.
-    #[must_use]
-    pub fn into_async_client(self) -> rumqttc::AsyncClient {
-        (*self.client).clone()
-    }
+/// Build the two halves of an MQTT connection.
+///
+/// The caller owns both: publish through the [`AsyncClient`], and poll the
+/// [`EventLoop`] so the connection makes progress. Neither half works
+/// without the other.
+///
+/// Prefer [`crate::SparkplugClient::connect`], which drives the event loop
+/// for you and tracks delivery. Use this only when you run your own loop.
+#[must_use]
+pub fn mqtt_parts(config: &MqttConfig) -> (AsyncClient, EventLoop) {
+    AsyncClient::new(mqtt_options(config), 10)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn mqtt_config_construction() {
-        let config = MqttConfig {
-            broker_url: "localhost".to_owned(),
-            broker_port: 1883,
-            transport: Transport::Tcp,
-            username: String::new(),
-            password: String::new(),
-            group_id: "test".to_owned(),
-            node_id: "node1".to_owned(),
-            version: "spBv1.0".to_owned(),
-        };
-        assert_eq!(config.broker_port, 1883);
-        assert_eq!(config.version, "spBv1.0");
-    }
-
-    #[test]
-    fn client_id_format() {
-        let config = MqttConfig {
+    fn config() -> MqttConfig {
+        MqttConfig {
             broker_url: "localhost".to_owned(),
             broker_port: 1883,
             transport: Transport::Tcp,
@@ -316,8 +138,19 @@ mod tests {
             group_id: "MyGroup".to_owned(),
             node_id: "node1".to_owned(),
             version: "spBv1.0".to_owned(),
-        };
-        let id = generate_client_id(&config);
+        }
+    }
+
+    #[test]
+    fn mqtt_config_construction() {
+        let config = config();
+        assert_eq!(config.broker_port, 1883);
+        assert_eq!(config.version, "spBv1.0");
+    }
+
+    #[test]
+    fn client_id_format() {
+        let id = generate_client_id(&config());
         assert!(id.starts_with("spBv1.0_MyGroup_node1_"));
         let suffix: &str = id
             .rsplit('_')
@@ -329,17 +162,11 @@ mod tests {
 
     #[test]
     fn mqtt_config_debug_redacts_password() {
-        let config = MqttConfig {
-            broker_url: "localhost".to_owned(),
-            broker_port: 1883,
-            transport: Transport::Tcp,
-            username: "admin".to_owned(),
-            password: "super_secret_password".to_owned(),
-            group_id: "test".to_owned(),
-            node_id: "node1".to_owned(),
-            version: "spBv1.0".to_owned(),
-        };
-        let debug_output = format!("{:?}", config);
+        let mut config = config();
+        config.username = "admin".to_owned();
+        config.password = "super_secret_password".to_owned();
+
+        let debug_output = format!("{config:?}");
         assert!(
             debug_output.contains("[REDACTED]"),
             "password should be redacted in Debug output"
@@ -352,5 +179,20 @@ mod tests {
             debug_output.contains("localhost"),
             "other fields should be visible"
         );
+    }
+
+    #[test]
+    fn sparkplug_requires_a_clean_session() {
+        assert!(
+            mqtt_options(&config()).clean_session(),
+            "Sparkplug requires clean_session = true; flush reports the \
+             publishes a reconnect discards because of it"
+        );
+    }
+
+    #[test]
+    fn the_options_carry_the_generated_client_id() {
+        let options = mqtt_options(&config());
+        assert!(options.client_id().starts_with("spBv1.0_MyGroup_node1_"));
     }
 }

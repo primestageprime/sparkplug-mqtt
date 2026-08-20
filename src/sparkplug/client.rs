@@ -1,4 +1,4 @@
-use crate::client::{MqttClient, MqttConfig};
+use crate::client::{MqttConfig, mqtt_parts};
 use crate::error::SparkplugError;
 use crate::payload::payload::Metric;
 use prost::Message;
@@ -8,10 +8,15 @@ use tokio::sync::oneshot;
 
 use super::delivery::DeliveryTracker;
 use super::eventloop::Health;
+use super::ids::{DeviceId, EdgeNodeId, GroupId};
 use super::payload_helpers::{
     create_birth_certificate, create_device_birth_certificate, create_payload,
 };
+use super::topic::{Namespace, SparkplugTopic};
+
+mod shutdown;
 use super::types::{MetricValue, Timestamp};
+use shutdown::{disconnect_outcome, shutdown_outcome};
 
 /// A self-contained SparkPlug B client that owns an `AsyncClient` and a
 /// background event loop.
@@ -48,7 +53,7 @@ use super::types::{MetricValue, Timestamp};
 /// (e.g. one connection, many assets).
 pub struct SparkplugClient {
     client: rumqttc::AsyncClient,
-    version: Arc<str>,
+    namespace: Namespace,
     node_id: Arc<str>,
     delivery: Arc<DeliveryTracker>,
     health: tokio::sync::watch::Sender<Health>,
@@ -83,15 +88,16 @@ impl SparkplugClient {
     /// # Errors
     ///
     /// Returns [`SparkplugError::ConnectionTimeout`] if the broker does not
-    /// answer within `timeout`.
+    /// answer within `timeout`. Returns
+    /// [`SparkplugError::InvalidNamespace`] when `config.version` cannot
+    /// stand as a topic segment.
     pub async fn connect_with_timeout(
         config: &MqttConfig,
         timeout: Duration,
     ) -> Result<Self, SparkplugError> {
-        let (mqtt_client, eventloop) = MqttClient::new(config.clone());
-        let async_client = mqtt_client.into_async_client();
+        let (async_client, eventloop) = mqtt_parts(config);
 
-        let version: Arc<str> = Arc::from(config.version.as_str());
+        let namespace = Namespace::new(&config.version)?;
         let node_id: Arc<str> = Arc::from(config.node_id.as_str());
 
         let (tx, rx) = oneshot::channel::<()>();
@@ -116,7 +122,7 @@ impl SparkplugClient {
 
         Ok(Self {
             client: async_client,
-            version,
+            namespace,
             node_id,
             delivery,
             health,
@@ -163,7 +169,7 @@ impl SparkplugClient {
         };
 
         let payload = create_payload(vec![metric], Some(Timestamp(timestamp_ms)));
-        let topic = ddata_topic(&self.version, group_id, node_id, device_id);
+        let topic = self.ddata_topic(group_id, node_id, device_id)?;
 
         self.publish_tracked(&topic, payload.encode_to_vec()).await
     }
@@ -189,22 +195,8 @@ impl SparkplugClient {
         device_id: &str,
         metrics: Vec<(String, MetricValue, u64)>,
     ) -> Result<(), SparkplugError> {
-        let proto_metrics: Vec<Metric> = metrics
-            .into_iter()
-            .map(|(name, value, ts)| {
-                let (proto_value, datatype) = value.to_proto();
-                Metric {
-                    name: Some(name),
-                    value: Some(proto_value),
-                    datatype: Some(datatype),
-                    timestamp: Some(ts),
-                    ..Default::default()
-                }
-            })
-            .collect();
-
-        let payload = create_payload(proto_metrics, None);
-        let topic = ddata_topic(&self.version, group_id, node_id, device_id);
+        let payload = create_payload(proto_metrics(metrics), None);
+        let topic = self.ddata_topic(group_id, node_id, device_id)?;
 
         self.publish_tracked(&topic, payload.encode_to_vec()).await
     }
@@ -228,31 +220,129 @@ impl SparkplugClient {
         group_id: &str,
         device_id: &str,
     ) -> Result<(), SparkplugError> {
-        // NBIRTH
-        let nbirth_topic = format!("{}/{}/NBIRTH/{}", self.version, group_id, self.node_id);
+        // Both births name this client's own edge node, while
+        // `publish_metric` takes the edge node per call. Where they differ,
+        // births and data land on different edge nodes.
+        let nbirth_topic = self
+            .namespace
+            .nbirth(GroupId::new(group_id)?, EdgeNodeId::new(&self.node_id)?);
         let nbirth_payload = create_birth_certificate();
         self.publish_tracked(&nbirth_topic, nbirth_payload.encode_to_vec())
             .await?;
 
-        // DBIRTH
-        let dbirth_topic = format!(
-            "{}/{}/DBIRTH/{}/{}",
-            self.version, group_id, self.node_id, device_id
+        let dbirth_topic = self.namespace.dbirth(
+            GroupId::new(group_id)?,
+            EdgeNodeId::new(&self.node_id)?,
+            DeviceId::new(device_id)?,
         );
         let dbirth_payload = create_device_birth_certificate();
         self.publish_tracked(&dbirth_topic, dbirth_payload.encode_to_vec())
             .await
     }
 
+    /// Publish one metric to a topic the caller already built.
+    ///
+    /// Prefer this to [`Self::publish_metric`]. The identity segments are
+    /// checked when their types are built, so a group, an edge node and a
+    /// device cannot be passed in the wrong order.
+    ///
+    /// ```rust,no_run
+    /// # use sparkplug_mqtt::{SparkplugClient, MetricValue, GroupId, EdgeNodeId, DeviceId};
+    /// # async fn example(client: &SparkplugClient) -> Result<(), sparkplug_mqtt::SparkplugError> {
+    /// let ns = client.namespace();
+    /// let topic = ns.ddata(
+    ///     GroupId::new("PlantFloor")?,
+    ///     EdgeNodeId::new("edge_node_1")?,
+    ///     DeviceId::new("pump_3")?,
+    /// );
+    /// client.publish_metric_to(&topic, "temperature", MetricValue::Float(23.5), 0).await
+    /// # }
+    /// ```
+    ///
+    /// # Cancel safety
+    ///
+    /// Not cancel-safe. See [`Self::publish_metric`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparkplugError::Publish`] when the client refuses the
+    /// message, and [`SparkplugError::Encode`] when the payload will not
+    /// encode. The topic cannot fail — it was checked when it was built.
+    pub async fn publish_metric_to(
+        &self,
+        topic: &SparkplugTopic,
+        metric_name: &str,
+        value: MetricValue,
+        timestamp_ms: u64,
+    ) -> Result<(), SparkplugError> {
+        let (proto_value, datatype) = value.to_proto();
+        let metric = Metric {
+            name: Some(metric_name.to_string()),
+            value: Some(proto_value),
+            datatype: Some(datatype),
+            timestamp: Some(timestamp_ms),
+            ..Default::default()
+        };
+
+        let payload = create_payload(vec![metric], Some(Timestamp(timestamp_ms)));
+        self.publish_tracked(topic, payload.encode_to_vec()).await
+    }
+
+    /// Publish a batch of metrics to a topic the caller already built.
+    ///
+    /// The batch goes out as one message. See [`Self::publish_metric_to`].
+    ///
+    /// # Cancel safety
+    ///
+    /// Not cancel-safe. See [`Self::publish_metric`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::publish_metric_to`].
+    pub async fn publish_metrics_to(
+        &self,
+        topic: &SparkplugTopic,
+        metrics: Vec<(String, MetricValue, u64)>,
+    ) -> Result<(), SparkplugError> {
+        let payload = create_payload(proto_metrics(metrics), None);
+        self.publish_tracked(topic, payload.encode_to_vec()).await
+    }
+
+    /// The namespace this client publishes on.
+    ///
+    /// Use it to build topics for [`Self::publish_metric_to`].
+    #[must_use]
+    pub fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+
+    /// Build a DDATA topic from unchecked identifiers.
+    fn ddata_topic(
+        &self,
+        group_id: &str,
+        node_id: &str,
+        device_id: &str,
+    ) -> Result<SparkplugTopic, SparkplugError> {
+        Ok(self.namespace.ddata(
+            GroupId::new(group_id)?,
+            EdgeNodeId::new(node_id)?,
+            DeviceId::new(device_id)?,
+        ))
+    }
+
     /// Publish one QoS 1 message and keep the delivery count honest.
     ///
     /// This is not cancel-safe. A cancelled call leaves `unacked` one too
     /// high, so every later flush reports `FlushTimeout`.
-    async fn publish_tracked(&self, topic: &str, payload: Vec<u8>) -> Result<(), SparkplugError> {
+    async fn publish_tracked(
+        &self,
+        topic: &SparkplugTopic,
+        payload: Vec<u8>,
+    ) -> Result<(), SparkplugError> {
         record_around_publish(
             &self.delivery,
             self.client
-                .publish(topic, rumqttc::QoS::AtLeastOnce, false, payload),
+                .publish(topic.to_string(), rumqttc::QoS::AtLeastOnce, false, payload),
         )
         .await
     }
@@ -327,78 +417,25 @@ impl SparkplugClient {
     }
 }
 
+/// Map caller metrics onto their protobuf form.
+fn proto_metrics(metrics: Vec<(String, MetricValue, u64)>) -> Vec<Metric> {
+    metrics
+        .into_iter()
+        .map(|(name, value, ts)| {
+            let (proto_value, datatype) = value.to_proto();
+            Metric {
+                name: Some(name),
+                value: Some(proto_value),
+                datatype: Some(datatype),
+                timestamp: Some(ts),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
 /// How long [`SparkplugClient::connect`] waits for the broker to answer.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Wait until the event loop reports the link is down, or `deadline` passes.
-///
-/// The loop sets [`Health::Disconnected`] once it writes the DISCONNECT
-/// packet, so this waits on the packet rather than on a fixed delay.
-/// Returns `false` when the deadline arrives first, which means the packet
-/// is unconfirmed. A link that is already down reports `true` at once,
-/// because a dead link needs no DISCONNECT.
-async fn wait_for_disconnect(
-    mut health: tokio::sync::watch::Receiver<Health>,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let down = health.wait_for(|state| *state == Health::Disconnected);
-    tokio::time::timeout_at(deadline, down)
-        .await
-        .is_ok_and(|state| state.is_ok())
-}
-
-/// What [`SparkplugClient::shutdown`] learns from its DISCONNECT attempt.
-#[derive(Debug)]
-enum Disconnected {
-    /// The event loop wrote the DISCONNECT packet.
-    Written,
-    /// The deadline arrived before the event loop confirmed the packet.
-    Unconfirmed,
-    /// The client refused the request, so no packet can go out.
-    Refused(rumqttc::ClientError),
-}
-
-/// Read the DISCONNECT request, then wait for the event loop to write it.
-///
-/// `requested` holds `Err` when the deadline beat the request, `Ok(Err)`
-/// when the client refused it, and `Ok(Ok)` when the request went through.
-async fn disconnect_outcome(
-    requested: Result<Result<(), rumqttc::ClientError>, tokio::time::error::Elapsed>,
-    health: tokio::sync::watch::Receiver<Health>,
-    deadline: tokio::time::Instant,
-) -> Disconnected {
-    match requested {
-        Err(_elapsed) => Disconnected::Unconfirmed,
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "the client refused the DISCONNECT request");
-            Disconnected::Refused(error)
-        }
-        Ok(Ok(())) => match wait_for_disconnect(health, deadline).await {
-            true => Disconnected::Written,
-            false => Disconnected::Unconfirmed,
-        },
-    }
-}
-
-/// Choose what [`SparkplugClient::shutdown`] reports.
-///
-/// A lost publish outranks a failed DISCONNECT, because the caller must
-/// publish those messages again. A refusal outranks the deadline, because
-/// it names the cause instead of the symptom.
-fn shutdown_outcome(
-    flushed: Result<(), SparkplugError>,
-    disconnected: Disconnected,
-    timeout: Duration,
-) -> Result<(), SparkplugError> {
-    match (flushed, disconnected) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Disconnected::Written) => Ok(()),
-        (Ok(()), Disconnected::Refused(error)) => Err(SparkplugError::Disconnect(error)),
-        (Ok(()), Disconnected::Unconfirmed) => {
-            Err(SparkplugError::ShutdownTimeout { after: timeout })
-        }
-    }
-}
 
 /// Count a publish, hand it to the client, then roll the count back when
 /// the client refuses it.
@@ -427,14 +464,6 @@ async fn record_around_publish(
             Err(SparkplugError::from(error))
         }
     }
-}
-
-/// Build the DDATA topic for a metric publish.
-///
-/// Extracted as a pure function so callers can assert the topic shape in
-/// tests without needing an MQTT broker.
-fn ddata_topic(version: &str, group_id: &str, node_id: &str, device_id: &str) -> String {
-    format!("{version}/{group_id}/DDATA/{node_id}/{device_id}")
 }
 
 #[cfg(test)]
