@@ -79,9 +79,9 @@ impl std::fmt::Debug for MqttConfig {
 pub fn generate_client_id(config: &MqttConfig) -> String {
     format!(
         "{}_{}_{}_{}",
-        &config.version,
-        &config.group_id,
-        &config.node_id,
+        config.version,
+        config.group_id,
+        config.node_id,
         rand::random::<u16>() % 9000 + 1000
     )
 }
