@@ -1,1 +1,4 @@
 /target
+
+# Internal notes. Do not ship these files.
+docs/
