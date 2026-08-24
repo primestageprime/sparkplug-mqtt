@@ -43,8 +43,7 @@ pub use payload::{Metric, Payload, decode_payload, metric};
 pub use sparkplug::{
     DEFAULT_CONNECT_TIMEOUT, DataType, DeliveryTracker, DeviceId, EdgeNodeId, GroupId, Health,
     HostId, MessageType, MetricValue, Namespace, PublishTicket, Role, Shape, SparkplugClient,
-    SparkplugTopic, Timestamp, create_birth_certificate, create_device_birth_certificate,
-    create_metric, create_payload,
+    SparkplugTopic, Timestamp,
 };
 
 // Re-export rumqttc types for convenience

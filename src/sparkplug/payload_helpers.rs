@@ -7,7 +7,7 @@ use super::types::{MetricValue, Timestamp};
 /// The caller states the instant. This builder reads no clock, so a test can
 /// pin what it expects.
 #[must_use]
-pub fn create_metric(name: impl Into<String>, value: MetricValue, timestamp: Timestamp) -> Metric {
+fn create_metric(name: impl Into<String>, value: MetricValue, timestamp: Timestamp) -> Metric {
     let (proto_value, datatype) = value.to_proto();
     Metric {
         name: Some(name.into()),
@@ -18,13 +18,22 @@ pub fn create_metric(name: impl Into<String>, value: MetricValue, timestamp: Tim
     }
 }
 
-/// Build a SparkPlug B payload from a list of metrics and an instant.
+/// Build a SparkPlug B payload from a list of metrics, an instant and a
+/// count.
+///
+/// The caller states `seq`. [`super::seq::SeqCounters`] holds one count for
+/// each edge node and reports the next one, so this builder stays a pure
+/// function of its arguments.
 #[must_use]
-pub fn create_payload(metrics: Vec<Metric>, timestamp: Timestamp) -> crate::payload::Payload {
+pub(super) fn create_payload(
+    metrics: Vec<Metric>,
+    timestamp: Timestamp,
+    seq: u8,
+) -> crate::payload::Payload {
     crate::payload::Payload {
         timestamp: Some(timestamp.0),
         metrics,
-        seq: Some(1),
+        seq: Some(u64::from(seq)),
         body: None,
         uuid: None,
     }
@@ -32,14 +41,15 @@ pub fn create_payload(metrics: Vec<Metric>, timestamp: Timestamp) -> crate::payl
 
 /// Create a node birth certificate payload (infallible).
 ///
-/// The payload and its one metric carry the same instant.
+/// The payload and its one metric carry the same instant. The caller states
+/// `seq`, which an NBIRTH takes from [`super::seq::SeqCounters::reset`].
 #[must_use]
-pub fn create_birth_certificate(timestamp: Timestamp) -> crate::payload::Payload {
+pub(super) fn create_birth_certificate(timestamp: Timestamp, seq: u8) -> crate::payload::Payload {
     let metric = create_metric("Node Control/Rebirth", MetricValue::Float(0.0), timestamp);
     crate::payload::Payload {
         timestamp: Some(timestamp.0),
         metrics: vec![metric],
-        seq: Some(0),
+        seq: Some(u64::from(seq)),
         body: None,
         uuid: None,
     }
@@ -47,14 +57,19 @@ pub fn create_birth_certificate(timestamp: Timestamp) -> crate::payload::Payload
 
 /// Create a device birth certificate payload (infallible).
 ///
-/// The payload and its one metric carry the same instant.
+/// The payload and its one metric carry the same instant. The caller states
+/// `seq`. A DBIRTH follows the NBIRTH of its edge node, so it takes the next
+/// count of that edge node rather than 0.
 #[must_use]
-pub fn create_device_birth_certificate(timestamp: Timestamp) -> crate::payload::Payload {
+pub(super) fn create_device_birth_certificate(
+    timestamp: Timestamp,
+    seq: u8,
+) -> crate::payload::Payload {
     let metric = create_metric("Device Control/Rebirth", MetricValue::Float(0.0), timestamp);
     crate::payload::Payload {
         timestamp: Some(timestamp.0),
         metrics: vec![metric],
-        seq: Some(0),
+        seq: Some(u64::from(seq)),
         ..Default::default()
     }
 }
@@ -111,7 +126,7 @@ mod tests {
     #[test]
     fn create_payload_uses_the_instant_the_caller_states() {
         assert_eq!(
-            create_payload(vec![], AT).timestamp,
+            create_payload(vec![], AT, 1).timestamp,
             Some(1_700_000_000_000)
         );
     }
@@ -121,8 +136,8 @@ mod tests {
         // Two clock reads used to build one birth, so the payload and its
         // metric could land on different milliseconds.
         for payload in [
-            create_birth_certificate(AT),
-            create_device_birth_certificate(AT),
+            create_birth_certificate(AT, 0),
+            create_device_birth_certificate(AT, 1),
         ] {
             assert_eq!(payload.timestamp, Some(AT.0));
             assert_eq!(payload.metrics[0].timestamp, Some(AT.0));
@@ -131,9 +146,18 @@ mod tests {
 
     #[test]
     fn create_birth_certificate_is_infallible() {
-        let p = create_birth_certificate(AT);
+        let p = create_birth_certificate(AT, 0);
         assert_eq!(p.seq, Some(0));
         assert_eq!(p.metrics.len(), 1);
+    }
+
+    #[test]
+    fn every_builder_writes_the_seq_the_caller_states() {
+        // The three builders wrote 1, 0 and 0 as literals. `seq` counts the
+        // messages of one edge node, so no literal can be right.
+        assert_eq!(create_payload(vec![], AT, 7).seq, Some(7));
+        assert_eq!(create_birth_certificate(AT, 0).seq, Some(0));
+        assert_eq!(create_device_birth_certificate(AT, 1).seq, Some(1));
     }
 
     #[test]
@@ -151,7 +175,7 @@ mod tests {
     fn metric_value_float_roundtrip() {
         use prost::Message;
         let metric = create_metric("temperature", MetricValue::Float(42.5), AT);
-        let payload = create_payload(vec![metric], AT);
+        let payload = create_payload(vec![metric], AT, 1);
         let bytes = payload.encode_to_vec();
         let decoded = crate::payload::decode_payload(&bytes).expect("should decode payload");
         assert_eq!(decoded.metrics.len(), 1);
@@ -167,7 +191,7 @@ mod tests {
     fn metric_value_string_roundtrip() {
         use prost::Message;
         let metric = create_metric("vessel_type", MetricValue::String("AUTO".into()), AT);
-        let payload = create_payload(vec![metric], AT);
+        let payload = create_payload(vec![metric], AT, 1);
         let bytes = payload.encode_to_vec();
         let decoded = crate::payload::decode_payload(&bytes).expect("should decode payload");
         assert!(matches!(
@@ -180,7 +204,7 @@ mod tests {
     fn metric_value_bool_roundtrip() {
         use prost::Message;
         let metric = create_metric("active", MetricValue::Bool(true), AT);
-        let payload = create_payload(vec![metric], AT);
+        let payload = create_payload(vec![metric], AT, 1);
         let bytes = payload.encode_to_vec();
         let decoded = crate::payload::decode_payload(&bytes).expect("should decode payload");
         assert!(matches!(
@@ -193,7 +217,7 @@ mod tests {
     fn metric_value_int_roundtrip() {
         use prost::Message;
         let metric = create_metric("count", MetricValue::Int(99), AT);
-        let payload = create_payload(vec![metric], AT);
+        let payload = create_payload(vec![metric], AT, 1);
         let bytes = payload.encode_to_vec();
         let decoded = crate::payload::decode_payload(&bytes).expect("should decode payload");
         assert!(matches!(

@@ -94,8 +94,11 @@ fn a_data_topic_keeps_the_edge_node_and_device_apart() {
         DeviceId::new("device-1").unwrap(),
     );
     assert_eq!(topic.to_string(), "spBv1.0/Stax/DDATA/edge-node-A/device-1");
-    assert_eq!(topic.node_id(), Some("edge-node-A"));
-    assert_eq!(topic.device_id(), Some("device-1"));
+    assert_eq!(
+        topic.node_id(),
+        Some(EdgeNodeId::new("edge-node-A").unwrap())
+    );
+    assert_eq!(topic.device_id(), Some(DeviceId::new("device-1").unwrap()));
 }
 
 // ---------------------------------------------------------------------------
@@ -106,8 +109,8 @@ fn a_data_topic_keeps_the_edge_node_and_device_apart() {
 fn a_node_topic_carries_no_device() {
     let topic = ns().nbirth(group(), node());
     assert_eq!(topic.shape(), Shape::Node);
-    assert_eq!(topic.group_id(), Some("G"));
-    assert_eq!(topic.node_id(), Some("n"));
+    assert_eq!(topic.group_id(), Some(group()));
+    assert_eq!(topic.node_id(), Some(node()));
     assert_eq!(topic.device_id(), None);
     assert_eq!(topic.host_id(), None);
 }
@@ -116,9 +119,9 @@ fn a_node_topic_carries_no_device() {
 fn a_device_topic_carries_every_identity_but_the_host() {
     let topic = ns().ddata(group(), node(), device());
     assert_eq!(topic.shape(), Shape::Device);
-    assert_eq!(topic.group_id(), Some("G"));
-    assert_eq!(topic.node_id(), Some("n"));
-    assert_eq!(topic.device_id(), Some("d"));
+    assert_eq!(topic.group_id(), Some(group()));
+    assert_eq!(topic.node_id(), Some(node()));
+    assert_eq!(topic.device_id(), Some(device()));
     assert_eq!(topic.host_id(), None);
 }
 
@@ -126,7 +129,7 @@ fn a_device_topic_carries_every_identity_but_the_host() {
 fn a_host_topic_carries_only_the_host() {
     let topic = ns().state(HostId::new("scada_1").unwrap());
     assert_eq!(topic.shape(), Shape::Host);
-    assert_eq!(topic.host_id(), Some("scada_1"));
+    assert_eq!(topic.host_id(), Some(HostId::new("scada_1").unwrap()));
     assert_eq!(topic.group_id(), None);
     assert_eq!(topic.node_id(), None);
     assert_eq!(topic.device_id(), None);

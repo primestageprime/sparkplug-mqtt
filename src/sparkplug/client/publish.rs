@@ -7,15 +7,16 @@
 use prost::Message;
 
 use crate::error::SparkplugError;
+use crate::payload::Payload;
 use crate::payload::payload::Metric;
 
 use super::SparkplugClient;
 use crate::sparkplug::delivery::DeliveryTracker;
-use crate::sparkplug::ids::{DeviceId, EdgeNodeId, GroupId};
 use crate::sparkplug::payload_helpers::{
     create_birth_certificate, create_device_birth_certificate, create_payload,
 };
 use crate::sparkplug::topic::SparkplugTopic;
+use crate::sparkplug::topic::ids::{DeviceId, EdgeNodeId, GroupId};
 use crate::sparkplug::types::{MessageType, MetricValue, Timestamp, WireOptions, wire_options};
 
 impl SparkplugClient {
@@ -33,6 +34,24 @@ impl SparkplugClient {
     /// A cancelled call drops the count without a rollback. `unacked` then
     /// stays one too high until the next disconnect, so every later
     /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
+    ///
+    /// It draws the `seq` of the edge node before the same `await`. A
+    /// cancelled call, and a message the client refuses, both leave that
+    /// number off the wire. The next message carries the number after it, so
+    /// a host application reads a gap and asks the edge node for a rebirth.
+    /// The counter does not roll back: another task can publish for the same
+    /// edge node while this call waits, so a rollback would give one number
+    /// to two messages. A host application recovers from a gap, because it
+    /// asks for a rebirth. It cannot recover from two messages that carry
+    /// one number.
+    ///
+    /// The same order applies to two tasks that publish for one edge node
+    /// on one client. This method draws the number, then
+    /// `AsyncClient::publish` waits for room in a bounded channel. The task
+    /// that drew 5 can wait while the task that drew 6 finds room, so 6
+    /// enters the channel first and the broker sends 6 before 5. A host
+    /// application reads that order as a gap and asks the edge node for a
+    /// rebirth. Publish for one edge node from one task to hold the order.
     ///
     /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
     /// publish in a `select!` branch that another branch can cancel. Publish
@@ -56,8 +75,8 @@ impl SparkplugClient {
             ..Default::default()
         };
 
-        let payload = create_payload(vec![metric], Timestamp(timestamp_ms));
         let topic = self.ddata_topic(group_id, node_id, device_id)?;
+        let payload = self.payload_for(&topic, vec![metric], Timestamp(timestamp_ms))?;
 
         self.publish_message(&topic, payload.encode_to_vec()).await
     }
@@ -72,6 +91,24 @@ impl SparkplugClient {
     /// stays one too high until the next disconnect, so every later
     /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
     ///
+    /// It draws the `seq` of the edge node before the same `await`. A
+    /// cancelled call, and a message the client refuses, both leave that
+    /// number off the wire. The next message carries the number after it, so
+    /// a host application reads a gap and asks the edge node for a rebirth.
+    /// The counter does not roll back: another task can publish for the same
+    /// edge node while this call waits, so a rollback would give one number
+    /// to two messages. A host application recovers from a gap, because it
+    /// asks for a rebirth. It cannot recover from two messages that carry
+    /// one number.
+    ///
+    /// The same order applies to two tasks that publish for one edge node
+    /// on one client. This method draws the number, then
+    /// `AsyncClient::publish` waits for room in a bounded channel. The task
+    /// that drew 5 can wait while the task that drew 6 finds room, so 6
+    /// enters the channel first and the broker sends 6 before 5. A host
+    /// application reads that order as a gap and asks the edge node for a
+    /// rebirth. Publish for one edge node from one task to hold the order.
+    ///
     /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
     /// publish in a `select!` branch that another branch can cancel. Publish
     /// the whole batch, then bound the wait with the `timeout` argument of
@@ -83,8 +120,8 @@ impl SparkplugClient {
         device_id: &str,
         metrics: Vec<(String, MetricValue, u64)>,
     ) -> Result<(), SparkplugError> {
-        let payload = create_payload(proto_metrics(metrics), Timestamp::now());
         let topic = self.ddata_topic(group_id, node_id, device_id)?;
+        let payload = self.payload_for(&topic, proto_metrics(metrics), Timestamp::now())?;
 
         self.publish_message(&topic, payload.encode_to_vec()).await
     }
@@ -98,6 +135,24 @@ impl SparkplugClient {
     /// A cancelled call drops the count without a rollback. `unacked` then
     /// stays one too high until the next disconnect, so every later
     /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
+    ///
+    /// It draws the `seq` of the edge node before the same `await`. A
+    /// cancelled call, and a message the client refuses, both leave that
+    /// number off the wire. The next message carries the number after it, so
+    /// a host application reads a gap and asks the edge node for a rebirth.
+    /// The counter does not roll back: another task can publish for the same
+    /// edge node while this call waits, so a rollback would give one number
+    /// to two messages. A host application recovers from a gap, because it
+    /// asks for a rebirth. It cannot recover from two messages that carry
+    /// one number.
+    ///
+    /// The same order applies to two tasks that publish for one edge node
+    /// on one client. This method draws the number, then
+    /// `AsyncClient::publish` waits for room in a bounded channel. The task
+    /// that drew 5 can wait while the task that drew 6 finds room, so 6
+    /// enters the channel first and the broker sends 6 before 5. A host
+    /// application reads that order as a gap and asks the edge node for a
+    /// rebirth. Publish for one edge node from one task to hold the order.
     ///
     /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
     /// publish in a `select!` branch that another branch can cancel. Publish
@@ -114,19 +169,24 @@ impl SparkplugClient {
         //
         // One birth event, so both payloads carry one instant.
         let at = Timestamp::now();
-        let nbirth_topic = self
-            .namespace
-            .nbirth(GroupId::new(group_id)?, EdgeNodeId::new(&self.node_id)?);
-        let nbirth_payload = create_birth_certificate(at);
+        let group = GroupId::new(group_id)?;
+        let node = EdgeNodeId::new(&self.node_id)?;
+
+        // Both births draw their count through `seq_for`, the one place
+        // that reads the counter. It reads the message type of the topic:
+        // an NBIRTH sets the count of its edge node back to 0, so the
+        // NBIRTH carries 0, and the DBIRTH beside it adds 1 and carries 1.
+        // The group and the node id together name the edge node that owns
+        // the count.
+        let nbirth_topic = self.namespace.nbirth(group, node);
+        let nbirth_payload = create_birth_certificate(at, self.seq_for(&nbirth_topic)?);
         self.publish_message(&nbirth_topic, nbirth_payload.encode_to_vec())
             .await?;
 
-        let dbirth_topic = self.namespace.dbirth(
-            GroupId::new(group_id)?,
-            EdgeNodeId::new(&self.node_id)?,
-            DeviceId::new(device_id)?,
-        );
-        let dbirth_payload = create_device_birth_certificate(at);
+        let dbirth_topic = self
+            .namespace
+            .dbirth(group, node, DeviceId::new(device_id)?);
+        let dbirth_payload = create_device_birth_certificate(at, self.seq_for(&dbirth_topic)?);
         self.publish_message(&dbirth_topic, dbirth_payload.encode_to_vec())
             .await
     }
@@ -158,7 +218,10 @@ impl SparkplugClient {
     ///
     /// Returns [`SparkplugError::Publish`] when the client refuses the
     /// message, and [`SparkplugError::Encode`] when the payload will not
-    /// encode. The topic cannot fail — it was checked when it was built.
+    /// encode. Returns [`SparkplugError::InvalidTopic`] when the topic names
+    /// no edge node, because a metric belongs to the count of one edge node.
+    /// The segments themselves cannot fail — the topic checked them when it
+    /// was built.
     pub async fn publish_metric_to(
         &self,
         topic: &SparkplugTopic,
@@ -175,7 +238,7 @@ impl SparkplugClient {
             ..Default::default()
         };
 
-        let payload = create_payload(vec![metric], Timestamp(timestamp_ms));
+        let payload = self.payload_for(topic, vec![metric], Timestamp(timestamp_ms))?;
         self.publish_message(topic, payload.encode_to_vec()).await
     }
 
@@ -195,8 +258,60 @@ impl SparkplugClient {
         topic: &SparkplugTopic,
         metrics: Vec<(String, MetricValue, u64)>,
     ) -> Result<(), SparkplugError> {
-        let payload = create_payload(proto_metrics(metrics), Timestamp::now());
+        let payload = self.payload_for(topic, proto_metrics(metrics), Timestamp::now())?;
         self.publish_message(topic, payload.encode_to_vec()).await
+    }
+
+    /// Build a payload for `topic`, and draw the `seq` its edge node
+    /// gives the message.
+    ///
+    /// Every publish that carries metrics passes through here.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::seq_for`].
+    fn payload_for(
+        &self,
+        topic: &SparkplugTopic,
+        metrics: Vec<Metric>,
+        at: Timestamp,
+    ) -> Result<Payload, SparkplugError> {
+        Ok(create_payload(metrics, at, self.seq_for(topic)?))
+    }
+
+    /// Draw the `seq` that the next message on `topic` carries.
+    ///
+    /// One place reads the counter, so every publish path counts alike.
+    /// The group and the edge node come from the topic, and that pair names
+    /// the edge node the count belongs to. A node topic and a device topic
+    /// both carry the pair, so both draw from one count.
+    ///
+    /// The message type of the topic decides which way the count moves. An
+    /// NBIRTH declares a new session for its edge node, so it sets that
+    /// count back to 0. Every other message adds 1. A caller who builds an
+    /// NBIRTH topic and publishes it through [`Self::publish_metric_to`]
+    /// therefore restarts the count, the same as [`Self::publish_birth`]
+    /// does.
+    ///
+    /// The topic hands back checked identifiers, so nothing here checks a
+    /// segment again — see ADR-0002.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparkplugError::InvalidTopic`] when the topic names no edge
+    /// node. A host topic has that shape, and a STATE message carries no
+    /// `seq`.
+    fn seq_for(&self, topic: &SparkplugTopic) -> Result<u8, SparkplugError> {
+        let (group, node) = topic.group_id().zip(topic.node_id()).ok_or_else(|| {
+            SparkplugError::InvalidTopic(format!(
+                "{topic} names no edge node, so it holds no seq count"
+            ))
+        })?;
+
+        Ok(match topic.message_type() {
+            MessageType::NBIRTH => self.seq.reset(group, node),
+            _ => self.seq.next(group, node),
+        })
     }
 
     /// Build a DDATA topic from unchecked identifiers.
@@ -240,9 +355,10 @@ impl SparkplugClient {
 
     /// Whether [`Self::flush`] can confirm what this client publishes.
     ///
-    /// A [`Role::Publisher`] client publishes at QoS 1, so the broker
-    /// acknowledges every message and `flush` reports what a disconnect
-    /// discarded. A [`Role::EdgeNode`] client publishes at the QoS the
+    /// A [`Role::Publisher`](crate::Role::Publisher) client publishes at QoS
+    /// 1, so the broker acknowledges every message and `flush` reports what a
+    /// disconnect discarded. A [`Role::EdgeNode`](crate::Role::EdgeNode)
+    /// client publishes at the QoS the
     /// specification fixes, which is QoS 0 for everything this crate can
     /// send today — the broker acknowledges none of it, so `flush` returns
     /// `Ok` without confirming anything.

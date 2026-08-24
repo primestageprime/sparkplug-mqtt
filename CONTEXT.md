@@ -75,18 +75,20 @@ _Avoid_: mode, kind, profile
 **Edge node client**:
 A client that runs the full Sparkplug session lifecycle for its own
 configured edge node — death registration, births, commands, and the QoS the
-spec fixes.
+specification fixes.
 
-`Role::EdgeNode` selects the QoS and the retain flag today, and nothing
-else. Death registration, `bdSeq`, `seq`, and the rebirth after a reconnect
-are not implemented, so a client in that role is not yet a conformant edge
-node. The term names the destination; the role is where the rest lands.
+`Role::EdgeNode` selects the QoS and the retain flag today. Every client
+also counts `seq` for each edge node it publishes for, and the pair
+`group_id/edge_node_id` names that edge node. Death registration, `bdSeq`,
+and the rebirth after a reconnect are not implemented, so a client in that
+role is not yet a conformant edge node. The term names the destination; the role is
+where the rest lands.
 
 **Publisher client**:
 A client that publishes data on behalf of edge nodes it does not own. It runs
 no lifecycle and must never announce a death, because the identity is
-borrowed per publish. It publishes at QoS 1 rather than the QoS the spec
-fixes, so its caller can confirm delivery. This is `Role::Publisher`, and it
+borrowed per publish. It publishes at QoS 1 rather than the QoS the
+specification fixes, so its caller can confirm delivery. This is `Role::Publisher`, and it
 is the default.
 _Avoid_: producer, writer
 

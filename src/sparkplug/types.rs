@@ -313,7 +313,11 @@ mod tests {
                 MessageType::NDEATH | MessageType::STATE => rumqttc::QoS::AtLeastOnce,
                 _ => rumqttc::QoS::AtMostOnce,
             };
-            assert_eq!(mt.spec_qos(), expected, "{mt} carries the wrong spec QoS");
+            assert_eq!(
+                mt.spec_qos(),
+                expected,
+                "{mt} carries the wrong specification QoS"
+            );
         }
     }
 
@@ -338,7 +342,7 @@ mod tests {
             assert_eq!(
                 options.qos,
                 mt.spec_qos(),
-                "{mt} must take the spec QoS in the edge node role"
+                "{mt} must take the specification QoS in the edge node role"
             );
         }
     }
@@ -373,9 +377,9 @@ mod tests {
 
     #[test]
     fn an_edge_node_client_tracks_nothing_it_can_publish_today() {
-        // Only NDEATH and STATE are QoS 1 under the spec. NDEATH is a Will
-        // the broker sends, and STATE has no publish path yet, so an edge
-        // node client has no tracked publish at all.
+        // Only NDEATH and STATE are QoS 1 under the specification. NDEATH
+        // is a Will the broker sends, and STATE has no publish path yet, so
+        // an edge node client has no tracked publish at all.
         for mt in [
             MessageType::NBIRTH,
             MessageType::NDATA,
@@ -399,7 +403,7 @@ mod tests {
             assert_eq!(
                 mt.spec_retain(),
                 mt == MessageType::STATE,
-                "{mt} carries the wrong spec retain flag"
+                "{mt} carries the wrong specification retain flag"
             );
         }
     }

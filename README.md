@@ -53,7 +53,7 @@ async fn main() -> Result<(), sparkplug_mqtt::SparkplugError> {
 
 ## Features
 
-- **SparkPlug B protocol** — full protobuf encoding/decoding per the Eclipse SparkPlug B spec
+- **SparkPlug B protocol** — full protobuf encoding/decoding per the Eclipse SparkPlug B specification
 - **Topic namespace** — `Namespace` builds and parses every Sparkplug topic, including
   the three-segment `spBv1.0/STATE/<host>` form. Parsing is strict: a topic addressed
   with the wrong shape for its message type is reported, not reinterpreted
@@ -137,7 +137,7 @@ DISCONNECT request, which names the cause instead of the deadline.
 ## Known Limitations
 
 - **A publish is not a delivery.** `publish_metric` and `publish_metrics` put the message in an internal queue and return `Ok(())`, even when the connection is down. Call `flush(timeout)` to wait until the broker acknowledges every message. Call `shutdown(timeout)` to drain the queue before a short-lived process exits. Sparkplug needs `clean_session = true`, so a disconnect discards the queued messages. `flush` reports that loss as `SparkplugError::PublishLost` instead of hiding it. Use `health()` to watch the link state.
-- **Sequence numbers are hardcoded.** The SparkPlug B spec requires `seq` to increment 0-255. This crate currently hardcodes `seq` to 0 (births) or 1 (data). A proper sequence counter is planned for a future release.
+- **A client is not yet a conformant edge node.** `seq` counts the messages of each edge node the client publishes for: an NBIRTH sets that count to 0, every message after it adds 1, and the count wraps from 255 back to 0. The pair `group_id/edge_node_id` names the edge node that owns the count. `bdSeq`, the NDEATH registration at connect time, and the rebirth after a reconnect are not implemented, so the session lifecycle still misses parts the specification requires.
 
 ## License
 
