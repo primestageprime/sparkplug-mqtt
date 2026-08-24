@@ -19,8 +19,26 @@
   keeping the two in step. `encode_type` took a string, so a misspelt name
   returned `0` — Unknown — and nothing reported it. Use `DataType` below.
   Neither function had a caller outside this crate.
+- `pub mod util` is removed, with `get_current_timestamp`. `Timestamp::now`
+  reads the clock now, and it is the only route to it in the crate. The
+  module exported one five-line function, so its interface was as wide as
+  its implementation, and two payload builders called it directly rather
+  than through `Timestamp::now` — one clock with two routes.
+- `create_metric`, `create_birth_certificate` and
+  `create_device_birth_certificate` each take a `Timestamp`.
+  `create_payload` takes a `Timestamp` rather than an `Option<Timestamp>`.
+  Every payload builder is now a pure function of its arguments, so a test
+  states the instant it expects instead of asserting the value is above
+  zero. Pass `Timestamp::now()` for the old behaviour. Neither
+  amygdala-rs nor amygdala-stax-rs calls any of the four.
 
 `Metric::numeric_value` and `Metric::format_value` are unchanged.
+
+### Fixed
+
+- `publish_birth` read the clock twice, so an NBIRTH and the DBIRTH beside
+  it could carry different milliseconds. One birth event now carries one
+  instant, and each birth payload stamps its own metric to match.
 
 ### Added
 

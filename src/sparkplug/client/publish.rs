@@ -56,7 +56,7 @@ impl SparkplugClient {
             ..Default::default()
         };
 
-        let payload = create_payload(vec![metric], Some(Timestamp(timestamp_ms)));
+        let payload = create_payload(vec![metric], Timestamp(timestamp_ms));
         let topic = self.ddata_topic(group_id, node_id, device_id)?;
 
         self.publish_message(&topic, payload.encode_to_vec()).await
@@ -83,7 +83,7 @@ impl SparkplugClient {
         device_id: &str,
         metrics: Vec<(String, MetricValue, u64)>,
     ) -> Result<(), SparkplugError> {
-        let payload = create_payload(proto_metrics(metrics), None);
+        let payload = create_payload(proto_metrics(metrics), Timestamp::now());
         let topic = self.ddata_topic(group_id, node_id, device_id)?;
 
         self.publish_message(&topic, payload.encode_to_vec()).await
@@ -111,10 +111,13 @@ impl SparkplugClient {
         // Both births name this client's own edge node, while
         // `publish_metric` takes the edge node per call. Where they differ,
         // births and data land on different edge nodes.
+        //
+        // One birth event, so both payloads carry one instant.
+        let at = Timestamp::now();
         let nbirth_topic = self
             .namespace
             .nbirth(GroupId::new(group_id)?, EdgeNodeId::new(&self.node_id)?);
-        let nbirth_payload = create_birth_certificate();
+        let nbirth_payload = create_birth_certificate(at);
         self.publish_message(&nbirth_topic, nbirth_payload.encode_to_vec())
             .await?;
 
@@ -123,7 +126,7 @@ impl SparkplugClient {
             EdgeNodeId::new(&self.node_id)?,
             DeviceId::new(device_id)?,
         );
-        let dbirth_payload = create_device_birth_certificate();
+        let dbirth_payload = create_device_birth_certificate(at);
         self.publish_message(&dbirth_topic, dbirth_payload.encode_to_vec())
             .await
     }
@@ -172,7 +175,7 @@ impl SparkplugClient {
             ..Default::default()
         };
 
-        let payload = create_payload(vec![metric], Some(Timestamp(timestamp_ms)));
+        let payload = create_payload(vec![metric], Timestamp(timestamp_ms));
         self.publish_message(topic, payload.encode_to_vec()).await
     }
 
@@ -192,7 +195,7 @@ impl SparkplugClient {
         topic: &SparkplugTopic,
         metrics: Vec<(String, MetricValue, u64)>,
     ) -> Result<(), SparkplugError> {
-        let payload = create_payload(proto_metrics(metrics), None);
+        let payload = create_payload(proto_metrics(metrics), Timestamp::now());
         self.publish_message(topic, payload.encode_to_vec()).await
     }
 
