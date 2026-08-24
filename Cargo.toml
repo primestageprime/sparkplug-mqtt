@@ -22,6 +22,10 @@ rand = "0.9.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tracing-subscriber = "0.3"
+# The channel type behind `rumqttc::AsyncClient::from_senders`, which lets a
+# test read the QoS and retain flag a publish actually carries. Already in the
+# tree as a rumqttc dependency, so this compiles no extra crate.
+flume = "0.11"
 
 [build-dependencies]
 prost-build = "0.14.1"

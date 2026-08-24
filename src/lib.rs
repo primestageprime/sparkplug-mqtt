@@ -42,9 +42,10 @@ pub use client::{MqttConfig, generate_client_id, mqtt_options, mqtt_parts, tls_t
 pub use error::SparkplugError;
 pub use payload::{Metric, Payload, decode_payload, decode_type, encode_type, metric};
 pub use sparkplug::{
-    DeliveryTracker, DeviceId, EdgeNodeId, GroupId, Health, HostId, MessageType, MetricValue,
-    Namespace, PublishTicket, Shape, SparkplugClient, SparkplugTopic, Timestamp,
-    create_birth_certificate, create_device_birth_certificate, create_metric, create_payload,
+    DEFAULT_CONNECT_TIMEOUT, DeliveryTracker, DeviceId, EdgeNodeId, GroupId, Health, HostId,
+    MessageType, MetricValue, Namespace, PublishTicket, Role, Shape, SparkplugClient,
+    SparkplugTopic, Timestamp, create_birth_certificate, create_device_birth_certificate,
+    create_metric, create_payload,
 };
 
 // Re-export rumqttc types for convenience

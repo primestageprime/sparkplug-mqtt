@@ -146,6 +146,78 @@ impl std::fmt::Display for MessageType {
 }
 
 // ---------------------------------------------------------------------------
+// Role / WireOptions
+// ---------------------------------------------------------------------------
+
+/// Which of the two roles this crate offers a client fills.
+///
+/// The role fixes the QoS and the retain flag every publish uses, and with
+/// them whether [`super::SparkplugClient::flush`] can confirm a message.
+///
+/// A role is a closed set of two, so this is deliberately not
+/// `#[non_exhaustive]` — a caller that matches on it should keep getting the
+/// exhaustiveness check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Publishes on behalf of edge nodes it does not own.
+    ///
+    /// Every message goes out at QoS 1, so the broker acknowledges it and
+    /// [`super::SparkplugClient::flush`] can report what was lost. This
+    /// deviates from the specification's QoS on purpose: the identity is
+    /// borrowed per publish, and the caller needs delivery confirmed.
+    ///
+    /// This is the default. [`super::SparkplugClient::connect`] uses it.
+    Publisher,
+
+    /// Runs the Sparkplug session for its own configured edge node.
+    ///
+    /// Every message goes out at the QoS the specification fixes, which is
+    /// QoS 0 for everything this crate can publish today. The broker never
+    /// acknowledges QoS 0, so nothing is tracked and
+    /// [`super::SparkplugClient::flush`] has nothing to confirm. Read
+    /// [`super::SparkplugClient::tracks_delivery`] before depending on it.
+    ///
+    /// This selects the QoS and retain rules only. The rest of the session
+    /// lifecycle — the NDEATH Will, `bdSeq`, `seq`, and the rebirth after a
+    /// reconnect — is not implemented yet, so a client in this role is not
+    /// yet a conformant edge node.
+    EdgeNode,
+}
+
+/// How one message goes onto the wire.
+///
+/// Named fields rather than a tuple. `retain` and `tracked` are both `bool`
+/// and mean opposite things, so a positional swap would be silent — the same
+/// reasoning ADR-0002 records for the topic identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WireOptions {
+    /// The QoS this message goes out at.
+    pub qos: rumqttc::QoS,
+    /// Whether the broker retains it.
+    pub retain: bool,
+    /// Whether [`super::DeliveryTracker`] may count it.
+    pub tracked: bool,
+}
+
+/// Decide how a message goes out, from the role and the message type.
+///
+/// This is the one place that answers all three questions. `tracked` follows
+/// the QoS rather than standing on its own: the tracker clears a count on a
+/// PubAck, and only QoS 1 produces one.
+pub(super) fn wire_options(role: Role, message_type: MessageType) -> WireOptions {
+    let qos = match role {
+        Role::EdgeNode => message_type.spec_qos(),
+        Role::Publisher => rumqttc::QoS::AtLeastOnce,
+    };
+
+    WireOptions {
+        qos,
+        retain: message_type.spec_retain(),
+        tracked: matches!(qos, rumqttc::QoS::AtLeastOnce),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Timestamp
 // ---------------------------------------------------------------------------
 
@@ -226,6 +298,82 @@ mod tests {
                 _ => rumqttc::QoS::AtMostOnce,
             };
             assert_eq!(mt.spec_qos(), expected, "{mt} carries the wrong spec QoS");
+        }
+    }
+
+    #[test]
+    fn a_publisher_client_keeps_qos_one_for_every_message_type() {
+        for mt in ALL {
+            let options = wire_options(Role::Publisher, mt);
+            assert_eq!(
+                options.qos,
+                rumqttc::QoS::AtLeastOnce,
+                "{mt} must stay at QoS 1 in the publisher role, so flush can \
+                 confirm it"
+            );
+            assert!(options.tracked, "{mt} is acknowledged, so it is tracked");
+        }
+    }
+
+    #[test]
+    fn an_edge_node_client_uses_the_qos_the_spec_fixes() {
+        for mt in ALL {
+            let options = wire_options(Role::EdgeNode, mt);
+            assert_eq!(
+                options.qos,
+                mt.spec_qos(),
+                "{mt} must take the spec QoS in the edge node role"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_acknowledged_message_is_tracked() {
+        for role in [Role::Publisher, Role::EdgeNode] {
+            for mt in ALL {
+                let options = wire_options(role, mt);
+                assert_eq!(
+                    options.tracked,
+                    options.qos == rumqttc::QoS::AtLeastOnce,
+                    "{mt} in {role:?}: the tracker counts a message only when \
+                     the broker acknowledges it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_retain_flag_follows_the_spec_in_both_roles() {
+        for role in [Role::Publisher, Role::EdgeNode] {
+            for mt in ALL {
+                assert_eq!(
+                    wire_options(role, mt).retain,
+                    mt.spec_retain(),
+                    "{mt} in {role:?} carries the wrong retain flag"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_edge_node_client_tracks_nothing_it_can_publish_today() {
+        // Only NDEATH and STATE are QoS 1 under the spec. NDEATH is a Will
+        // the broker sends, and STATE has no publish path yet, so an edge
+        // node client has no tracked publish at all.
+        for mt in [
+            MessageType::NBIRTH,
+            MessageType::NDATA,
+            MessageType::DBIRTH,
+            MessageType::DDATA,
+            MessageType::DDEATH,
+            MessageType::NCMD,
+            MessageType::DCMD,
+        ] {
+            assert!(
+                !wire_options(Role::EdgeNode, mt).tracked,
+                "{mt} goes out at QoS 0 for an edge node, so flush cannot \
+                 confirm it"
+            );
         }
     }
 

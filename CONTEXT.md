@@ -66,15 +66,28 @@ _Avoid_: subscriber, listener, consumer
 
 ### Roles this crate offers
 
+**Role**:
+Which of the two roles below a client fills. It is fixed when the client
+connects, and it decides the QoS and the retain flag of every publish. The
+type is `Role`, with the variants `EdgeNode` and `Publisher`.
+_Avoid_: mode, kind, profile
+
 **Edge node client**:
 A client that runs the full Sparkplug session lifecycle for its own
 configured edge node — death registration, births, commands, and the QoS the
 spec fixes.
 
+`Role::EdgeNode` selects the QoS and the retain flag today, and nothing
+else. Death registration, `bdSeq`, `seq`, and the rebirth after a reconnect
+are not implemented, so a client in that role is not yet a conformant edge
+node. The term names the destination; the role is where the rest lands.
+
 **Publisher client**:
 A client that publishes data on behalf of edge nodes it does not own. It runs
 no lifecycle and must never announce a death, because the identity is
-borrowed per publish.
+borrowed per publish. It publishes at QoS 1 rather than the QoS the spec
+fixes, so its caller can confirm delivery. This is `Role::Publisher`, and it
+is the default.
 _Avoid_: producer, writer
 
 ### Messages
@@ -123,3 +136,11 @@ _Avoid_: dropped, failed, missed
 Waiting until the broker has acknowledged every publish since the last such
 wait, and reporting anything lost in that window.
 _Avoid_: drain, sync, commit
+
+**Tracked**:
+Whether the crate counts a publish toward a flush. A publish is tracked when
+the broker will acknowledge it, which means QoS 1. A QoS 0 publish is
+untracked: no acknowledgement can arrive, so counting it would hold every
+later flush open. The role decides this for every message a client sends —
+read it with `tracks_delivery`.
+_Avoid_: confirmed, guaranteed, reliable

@@ -1,21 +1,16 @@
 use crate::client::{MqttConfig, mqtt_parts};
 use crate::error::SparkplugError;
-use crate::payload::payload::Metric;
-use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
 use super::delivery::DeliveryTracker;
 use super::eventloop::Health;
-use super::ids::{DeviceId, EdgeNodeId, GroupId};
-use super::payload_helpers::{
-    create_birth_certificate, create_device_birth_certificate, create_payload,
-};
-use super::topic::{Namespace, SparkplugTopic};
+use super::topic::Namespace;
+use super::types::Role;
 
+mod publish;
 mod shutdown;
-use super::types::{MetricValue, Timestamp};
 use shutdown::{disconnect_outcome, shutdown_outcome};
 
 /// A self-contained SparkPlug B client that owns an `AsyncClient` and a
@@ -57,6 +52,7 @@ pub struct SparkplugClient {
     node_id: Arc<str>,
     delivery: Arc<DeliveryTracker>,
     health: tokio::sync::watch::Sender<Health>,
+    role: Role,
     event_loop_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -77,7 +73,7 @@ impl SparkplugClient {
     /// Returns [`SparkplugError::ConnectionTimeout`] if the broker doesn't
     /// respond within 5 seconds.
     pub async fn connect(config: &MqttConfig) -> Result<Self, SparkplugError> {
-        Self::connect_with_timeout(config, DEFAULT_CONNECT_TIMEOUT).await
+        Self::connect_as(config, Role::Publisher, DEFAULT_CONNECT_TIMEOUT).await
     }
 
     /// Connect, waiting up to `timeout` for the broker to answer.
@@ -93,6 +89,31 @@ impl SparkplugClient {
     /// stand as a topic segment.
     pub async fn connect_with_timeout(
         config: &MqttConfig,
+        timeout: Duration,
+    ) -> Result<Self, SparkplugError> {
+        Self::connect_as(config, Role::Publisher, timeout).await
+    }
+
+    /// Connect in a chosen role, waiting up to `timeout` for the broker.
+    ///
+    /// The role fixes the QoS and the retain flag every publish uses, and
+    /// with them whether [`Self::flush`] can confirm anything. Read
+    /// [`Role`] before choosing, and [`Self::tracks_delivery`] after.
+    ///
+    /// [`Self::connect`] and [`Self::connect_with_timeout`] both call this
+    /// with [`Role::Publisher`], which is why raising the crate version
+    /// changes no existing caller's behaviour. Pass
+    /// [`DEFAULT_CONNECT_TIMEOUT`] for the timeout those two use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparkplugError::ConnectionTimeout`] if the broker does not
+    /// answer within `timeout`. Returns
+    /// [`SparkplugError::InvalidNamespace`] when `config.version` cannot
+    /// stand as a topic segment.
+    pub async fn connect_as(
+        config: &MqttConfig,
+        role: Role,
         timeout: Duration,
     ) -> Result<Self, SparkplugError> {
         let (async_client, eventloop) = mqtt_parts(config);
@@ -126,225 +147,18 @@ impl SparkplugClient {
             node_id,
             delivery,
             health,
+            role,
             event_loop_handle,
         })
     }
 
     /// Publish a single metric as a DDATA message on behalf of `node_id`.
-    ///
-    /// The Sparkplug topic is `{version}/{group_id}/DDATA/{node_id}/{device_id}`,
-    /// so the caller controls the edge-node identity per publish. A single
-    /// client can therefore publish as many different edge nodes — useful when
-    /// a back-end service injects historical or synthetic metrics on behalf of
-    /// multiple assets.
-    ///
-    /// # Cancel safety
-    ///
-    /// This method is not cancel-safe. It counts the publish before it hands
-    /// the message to the client, and it holds that count across an `await`.
-    /// A cancelled call drops the count without a rollback. `unacked` then
-    /// stays one too high until the next disconnect, so every later
-    /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
-    ///
-    /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
-    /// publish in a `select!` branch that another branch can cancel. Publish
-    /// the whole batch, then bound the wait with the `timeout` argument of
-    /// [`Self::flush`].
-    pub async fn publish_metric(
-        &self,
-        group_id: &str,
-        node_id: &str,
-        device_id: &str,
-        metric_name: &str,
-        value: MetricValue,
-        timestamp_ms: u64,
-    ) -> Result<(), SparkplugError> {
-        let (proto_value, datatype) = value.to_proto();
-        let metric = Metric {
-            name: Some(metric_name.to_string()),
-            value: Some(proto_value),
-            datatype: Some(datatype),
-            timestamp: Some(timestamp_ms),
-            ..Default::default()
-        };
-
-        let payload = create_payload(vec![metric], Some(Timestamp(timestamp_ms)));
-        let topic = self.ddata_topic(group_id, node_id, device_id)?;
-
-        self.publish_tracked(&topic, payload.encode_to_vec()).await
-    }
-
-    /// Publish a batch of metrics as a single DDATA message on behalf of `node_id`.
-    ///
-    /// # Cancel safety
-    ///
-    /// This method is not cancel-safe. It counts the publish before it hands
-    /// the message to the client, and it holds that count across an `await`.
-    /// A cancelled call drops the count without a rollback. `unacked` then
-    /// stays one too high until the next disconnect, so every later
-    /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
-    ///
-    /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
-    /// publish in a `select!` branch that another branch can cancel. Publish
-    /// the whole batch, then bound the wait with the `timeout` argument of
-    /// [`Self::flush`].
-    pub async fn publish_metrics(
-        &self,
-        group_id: &str,
-        node_id: &str,
-        device_id: &str,
-        metrics: Vec<(String, MetricValue, u64)>,
-    ) -> Result<(), SparkplugError> {
-        let payload = create_payload(proto_metrics(metrics), None);
-        let topic = self.ddata_topic(group_id, node_id, device_id)?;
-
-        self.publish_tracked(&topic, payload.encode_to_vec()).await
-    }
-
-    /// Publish NBIRTH + DBIRTH for a device.
-    ///
-    /// # Cancel safety
-    ///
-    /// This method is not cancel-safe. It counts the publish before it hands
-    /// the message to the client, and it holds that count across an `await`.
-    /// A cancelled call drops the count without a rollback. `unacked` then
-    /// stays one too high until the next disconnect, so every later
-    /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
-    ///
-    /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
-    /// publish in a `select!` branch that another branch can cancel. Publish
-    /// the whole batch, then bound the wait with the `timeout` argument of
-    /// [`Self::flush`].
-    pub async fn publish_birth(
-        &self,
-        group_id: &str,
-        device_id: &str,
-    ) -> Result<(), SparkplugError> {
-        // Both births name this client's own edge node, while
-        // `publish_metric` takes the edge node per call. Where they differ,
-        // births and data land on different edge nodes.
-        let nbirth_topic = self
-            .namespace
-            .nbirth(GroupId::new(group_id)?, EdgeNodeId::new(&self.node_id)?);
-        let nbirth_payload = create_birth_certificate();
-        self.publish_tracked(&nbirth_topic, nbirth_payload.encode_to_vec())
-            .await?;
-
-        let dbirth_topic = self.namespace.dbirth(
-            GroupId::new(group_id)?,
-            EdgeNodeId::new(&self.node_id)?,
-            DeviceId::new(device_id)?,
-        );
-        let dbirth_payload = create_device_birth_certificate();
-        self.publish_tracked(&dbirth_topic, dbirth_payload.encode_to_vec())
-            .await
-    }
-
-    /// Publish one metric to a topic the caller already built.
-    ///
-    /// Prefer this to [`Self::publish_metric`]. The identity segments are
-    /// checked when their types are built, so a group, an edge node and a
-    /// device cannot be passed in the wrong order.
-    ///
-    /// ```rust,no_run
-    /// # use sparkplug_mqtt::{SparkplugClient, MetricValue, GroupId, EdgeNodeId, DeviceId};
-    /// # async fn example(client: &SparkplugClient) -> Result<(), sparkplug_mqtt::SparkplugError> {
-    /// let ns = client.namespace();
-    /// let topic = ns.ddata(
-    ///     GroupId::new("PlantFloor")?,
-    ///     EdgeNodeId::new("edge_node_1")?,
-    ///     DeviceId::new("pump_3")?,
-    /// );
-    /// client.publish_metric_to(&topic, "temperature", MetricValue::Float(23.5), 0).await
-    /// # }
-    /// ```
-    ///
-    /// # Cancel safety
-    ///
-    /// Not cancel-safe. See [`Self::publish_metric`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SparkplugError::Publish`] when the client refuses the
-    /// message, and [`SparkplugError::Encode`] when the payload will not
-    /// encode. The topic cannot fail — it was checked when it was built.
-    pub async fn publish_metric_to(
-        &self,
-        topic: &SparkplugTopic,
-        metric_name: &str,
-        value: MetricValue,
-        timestamp_ms: u64,
-    ) -> Result<(), SparkplugError> {
-        let (proto_value, datatype) = value.to_proto();
-        let metric = Metric {
-            name: Some(metric_name.to_string()),
-            value: Some(proto_value),
-            datatype: Some(datatype),
-            timestamp: Some(timestamp_ms),
-            ..Default::default()
-        };
-
-        let payload = create_payload(vec![metric], Some(Timestamp(timestamp_ms)));
-        self.publish_tracked(topic, payload.encode_to_vec()).await
-    }
-
-    /// Publish a batch of metrics to a topic the caller already built.
-    ///
-    /// The batch goes out as one message. See [`Self::publish_metric_to`].
-    ///
-    /// # Cancel safety
-    ///
-    /// Not cancel-safe. See [`Self::publish_metric`].
-    ///
-    /// # Errors
-    ///
-    /// See [`Self::publish_metric_to`].
-    pub async fn publish_metrics_to(
-        &self,
-        topic: &SparkplugTopic,
-        metrics: Vec<(String, MetricValue, u64)>,
-    ) -> Result<(), SparkplugError> {
-        let payload = create_payload(proto_metrics(metrics), None);
-        self.publish_tracked(topic, payload.encode_to_vec()).await
-    }
-
     /// The namespace this client publishes on.
     ///
     /// Use it to build topics for [`Self::publish_metric_to`].
     #[must_use]
     pub fn namespace(&self) -> &Namespace {
         &self.namespace
-    }
-
-    /// Build a DDATA topic from unchecked identifiers.
-    fn ddata_topic(
-        &self,
-        group_id: &str,
-        node_id: &str,
-        device_id: &str,
-    ) -> Result<SparkplugTopic, SparkplugError> {
-        Ok(self.namespace.ddata(
-            GroupId::new(group_id)?,
-            EdgeNodeId::new(node_id)?,
-            DeviceId::new(device_id)?,
-        ))
-    }
-
-    /// Publish one QoS 1 message and keep the delivery count honest.
-    ///
-    /// This is not cancel-safe. A cancelled call leaves `unacked` one too
-    /// high, so every later flush reports `FlushTimeout`.
-    async fn publish_tracked(
-        &self,
-        topic: &SparkplugTopic,
-        payload: Vec<u8>,
-    ) -> Result<(), SparkplugError> {
-        record_around_publish(
-            &self.delivery,
-            self.client
-                .publish(topic.to_string(), rumqttc::QoS::AtLeastOnce, false, payload),
-        )
-        .await
     }
 
     /// Wait until the broker has acknowledged every publish from this client.
@@ -417,54 +231,11 @@ impl SparkplugClient {
     }
 }
 
-/// Map caller metrics onto their protobuf form.
-fn proto_metrics(metrics: Vec<(String, MetricValue, u64)>) -> Vec<Metric> {
-    metrics
-        .into_iter()
-        .map(|(name, value, ts)| {
-            let (proto_value, datatype) = value.to_proto();
-            Metric {
-                name: Some(name),
-                value: Some(proto_value),
-                datatype: Some(datatype),
-                timestamp: Some(ts),
-                ..Default::default()
-            }
-        })
-        .collect()
-}
-
 /// How long [`SparkplugClient::connect`] waits for the broker to answer.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Count a publish, hand it to the client, then roll the count back when
-/// the client refuses it.
 ///
-/// The count must rise before `publish` runs. `publish_metric` and `flush`
-/// both take `&self`, so a task that shares this client can flush while a
-/// publish is still in flight. A disconnect in that window would record no
-/// loss, and an early PubAck would leave a count that never clears.
-/// Over-counting only delays a flush, so it is the safe direction.
-///
-/// The rollback carries the ticket from the matching `record_publish`, so a
-/// refusal can never cancel a count that a disconnect cleared or that
-/// belongs to a publish from another task.
-///
-/// Split out as a free function so a test can drive the ordering without a
-/// broker.
-async fn record_around_publish(
-    delivery: &DeliveryTracker,
-    publish: impl Future<Output = Result<(), rumqttc::ClientError>>,
-) -> Result<(), SparkplugError> {
-    let ticket = delivery.record_publish();
-    match publish.await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            delivery.record_publish_failed(ticket);
-            Err(SparkplugError::from(error))
-        }
-    }
-}
+/// Pass this to [`SparkplugClient::connect_as`] to get the same wait that
+/// [`SparkplugClient::connect`] uses.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests;
