@@ -17,6 +17,36 @@
 
 `Metric::numeric_value` and `Metric::format_value` are unchanged.
 
+### Added
+
+- `Role`, with the variants `Publisher` and `EdgeNode`. It is fixed when a
+  client connects and decides the QoS and the retain flag of every publish,
+  and with them whether `flush` can confirm a message. See ADR-0003.
+- `SparkplugClient::connect_as(config, role, timeout)`. `connect` and
+  `connect_with_timeout` keep their signatures and delegate to it with
+  `Role::Publisher`, so no existing caller changes behaviour.
+- `SparkplugClient::tracks_delivery`. It reports whether `flush` can confirm
+  what this client publishes. Assert it once at startup before gating a
+  durable write on `flush`. A `Role::EdgeNode` client publishes at QoS 0,
+  which the broker never acknowledges, so its `flush` returns `Ok` without
+  confirming anything.
+- `DEFAULT_CONNECT_TIMEOUT` is now public, so the wait `connect` uses can be
+  named when calling `connect_as`.
+
+### Changed
+
+- `MessageType::spec_qos` and `MessageType::spec_retain` now have a caller
+  inside the crate. They stated the specification's rules while the publish
+  path hardcoded QoS 1 and retain false, so the rules were tested and the
+  wire ignored them. Both stay public and unchanged.
+- The delivery tracker no longer counts a publish the broker will not
+  acknowledge. Its own documentation asked for this — "Do not call this for
+  QoS 0" — and nothing enforced it.
+
+This does not close G4 of the conformance audit. Every client that exists
+today is a `Role::Publisher` and still publishes at QoS 1. G4 closes when an
+`EdgeNode` client runs the session lifecycle, which is separate work.
+
 ## 0.4.0
 
 A breaking release. `connect`, `publish_metric`, `publish_metrics`, and
