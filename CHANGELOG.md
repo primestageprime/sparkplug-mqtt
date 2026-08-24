@@ -24,18 +24,58 @@
   module exported one five-line function, so its interface was as wide as
   its implementation, and two payload builders called it directly rather
   than through `Timestamp::now` — one clock with two routes.
-- `create_metric`, `create_birth_certificate` and
-  `create_device_birth_certificate` each take a `Timestamp`.
-  `create_payload` takes a `Timestamp` rather than an `Option<Timestamp>`.
-  Every payload builder is now a pure function of its arguments, so a test
-  states the instant it expects instead of asserting the value is above
-  zero. Pass `Timestamp::now()` for the old behaviour. Neither
-  amygdala-rs nor amygdala-stax-rs calls any of the four.
+- `create_metric`, `create_payload`, `create_birth_certificate` and
+  `create_device_birth_certificate` leave the crate interface. They built
+  the payloads of the publish path, and that path is the one caller they
+  have: no caller exists in amygdala-rs, in amygdala-stax-rs, or in
+  `examples/publish_every_30s.rs`. `create_metric` is now private to
+  `payload_helpers`, and the other three are visible inside `sparkplug`
+  alone. Build a payload through `SparkplugClient::publish_metric_to` or
+  `publish_metrics_to`.
+- The same four builders changed shape as they moved. Each takes a
+  `Timestamp` instead of reading the clock, `create_payload` takes a
+  `Timestamp` rather than an `Option<Timestamp>`, and the three payload
+  builders take a `seq` that only the client can supply. Every payload
+  builder is now a pure function of its arguments, so a test states the
+  instant it expects instead of asserting the value is above zero. No caller
+  outside the crate can reach them, so no caller outside the crate changes.
+- `SparkplugTopic::group_id`, `node_id`, `device_id` and `host_id` return
+  `Option<GroupId<'_>>`, `Option<EdgeNodeId<'_>>`, `Option<DeviceId<'_>>` and
+  `Option<HostId<'_>>` rather than `Option<&str>`. A topic holds segments
+  that passed their check when it was built, so an accessor that hands back
+  `&str` makes the next caller check them again — and ADR-0002 checks a value
+  once, where it enters its type. The client reads the group and the edge
+  node of every publish to draw its `seq`, and it now handles no error that
+  cannot happen. Call `as_str()` on the identifier for the value the
+  accessor used to return.
 
 `Metric::numeric_value` and `Metric::format_value` are unchanged.
 
 ### Fixed
 
+- `seq` was three literals: `create_payload` wrote 1, and the two birth
+  builders wrote 0. `seq` counts the messages of one edge node, so no literal
+  can be right. A host application reads the count to find a message it did
+  not receive, and a literal writes one value in every message, so no count
+  can show a gap. `SeqCounters` now holds one count for each edge node. An
+  NBIRTH sets that count to 0, every message after it adds 1, and the count
+  wraps from 255 back to 0. The pair `group_id/edge_node_id` names the edge
+  node that owns the count, as Sparkplug requires: the same node id in two
+  groups names two edge nodes, and each one counts alone. The client draws
+  the count in one place, from the topic of the message, so two edge nodes
+  that share one client keep separate counts. That one place reads the
+  message type of the topic, so every publish path restarts the count at an
+  NBIRTH — including a caller who builds an NBIRTH topic and sends it
+  through `publish_metric_to`. A publish the client refuses,
+  and a call the caller cancels, each leave one number off the wire, so a
+  host application reads a gap and asks for a rebirth. The counter does not
+  roll back, because a rollback races a publish from another task and would
+  give one number to two messages. Two tasks that publish for one edge node
+  on one client can still reach the broker in the other order, because the
+  client draws the number before it waits for room in a bounded channel — so
+  publish for one edge node from one task. This closes G5 of
+  `docs/sparkplug-conformance-gaps.md`. `bdSeq`, the NDEATH Will and the
+  rebirth after a reconnect stay open — see G1, G2 and G3.
 - `publish_birth` read the clock twice, so an NBIRTH and the DBIRTH beside
   it could carry different milliseconds. One birth event now carries one
   instant, and each birth payload stamps its own metric to match.

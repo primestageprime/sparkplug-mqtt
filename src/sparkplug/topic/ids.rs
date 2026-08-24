@@ -14,7 +14,7 @@ use crate::error::SparkplugError;
 
 /// Whether a string can stand as one topic segment.
 ///
-/// [`super::topic::Namespace`] checks its own segment the same way.
+/// [`super::Namespace`] checks its own segment the same way.
 pub(super) fn is_usable_segment(value: &str) -> bool {
     !value.is_empty() && !value.contains(['/', '+', '#'])
 }
@@ -56,6 +56,28 @@ macro_rules! topic_id {
                         $label
                     ))),
                 }
+            }
+
+            /// Wrap a segment that a caller checked already.
+            ///
+            /// A topic stores the text of a segment that entered through
+            /// `new` or through the parser, which checks the same way. The
+            /// accessors on a topic hand that text back as its own type, and
+            /// this is the wrap they use. ADR-0002 checks a value once, where
+            /// it enters its type, so a second check here can never fail and
+            /// would force a caller to handle an error that cannot happen.
+            ///
+            /// Call this only with a segment a check has passed. The
+            /// `debug_assert` states that rule to the compiler. A debug
+            /// build panics on a segment that skipped the check, and a
+            /// release build drops the test. `super::super::seq` joins a
+            /// group and an edge node with `/` to key its counts, and that
+            /// key names one edge node only while no segment holds a `/`.
+            ///
+            /// [`super`] alone calls this, so the visibility stops there.
+            pub(in crate::sparkplug::topic) fn wrap_checked(value: &'a str) -> Self {
+                debug_assert!(is_usable_segment(value));
+                Self(value)
             }
 
             /// The identifier as it appears in a topic.

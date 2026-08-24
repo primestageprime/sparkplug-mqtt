@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 use crate::error::SparkplugError;
 
-use super::ids::{DeviceId, EdgeNodeId, GroupId, HostId, is_usable_segment};
+/// The checked identifiers that stand as the segments of a topic.
+pub(crate) mod ids;
+
+use self::ids::{DeviceId, EdgeNodeId, GroupId, HostId, is_usable_segment};
 use super::types::{MessageType, Shape};
 
 /// The root segment of every Sparkplug topic, which names the protocol
@@ -188,12 +191,12 @@ impl Namespace {
     ///
     /// let t = ns.parse("spBv1.0/PlantFloor/DDATA/edge_node_1/pump_3")?;
     /// assert_eq!(t.message_type(), MessageType::DDATA);
-    /// assert_eq!(t.device_id(), Some("pump_3"));
+    /// assert_eq!(t.device_id().map(|d| d.as_str()), Some("pump_3"));
     ///
     /// // A host topic carries no group and no edge node.
     /// let t = ns.parse("spBv1.0/STATE/scada_1")?;
     /// assert_eq!(t.shape(), Shape::Host);
-    /// assert_eq!(t.host_id(), Some("scada_1"));
+    /// assert_eq!(t.host_id().map(|h| h.as_str()), Some("scada_1"));
     /// assert_eq!(t.group_id(), None);
     ///
     /// // An NBIRTH is node-shaped, so a device segment is a publisher error.
@@ -301,7 +304,10 @@ enum Address {
 ///
 /// The identity accessors return `Option` because the shape decides which
 /// identities exist. A host topic has no group and no edge node; a node topic
-/// has no device.
+/// has no device. Each one returns the identifier's own type, because the
+/// segment passed its check when the topic was built. A caller passes the
+/// value straight to another topic constructor, and handles no error that
+/// cannot happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SparkplugTopic {
     namespace: Arc<str>,
@@ -329,37 +335,49 @@ impl SparkplugTopic {
     }
 
     /// The group, on node and device topics. `None` on a host topic.
+    ///
+    /// Read the text with [`GroupId::as_str`].
     #[must_use]
-    pub fn group_id(&self) -> Option<&str> {
+    pub fn group_id(&self) -> Option<GroupId<'_>> {
         match &self.address {
-            Address::Node { group_id, .. } | Address::Device { group_id, .. } => Some(group_id),
+            Address::Node { group_id, .. } | Address::Device { group_id, .. } => {
+                Some(GroupId::wrap_checked(group_id))
+            }
             Address::Host { .. } => None,
         }
     }
 
     /// The edge node, on node and device topics. `None` on a host topic.
+    ///
+    /// Read the text with [`EdgeNodeId::as_str`].
     #[must_use]
-    pub fn node_id(&self) -> Option<&str> {
+    pub fn node_id(&self) -> Option<EdgeNodeId<'_>> {
         match &self.address {
-            Address::Node { node_id, .. } | Address::Device { node_id, .. } => Some(node_id),
+            Address::Node { node_id, .. } | Address::Device { node_id, .. } => {
+                Some(EdgeNodeId::wrap_checked(node_id))
+            }
             Address::Host { .. } => None,
         }
     }
 
     /// The device, on device topics only.
+    ///
+    /// Read the text with [`DeviceId::as_str`].
     #[must_use]
-    pub fn device_id(&self) -> Option<&str> {
+    pub fn device_id(&self) -> Option<DeviceId<'_>> {
         match &self.address {
-            Address::Device { device_id, .. } => Some(device_id),
+            Address::Device { device_id, .. } => Some(DeviceId::wrap_checked(device_id)),
             Address::Node { .. } | Address::Host { .. } => None,
         }
     }
 
     /// The host application, on host topics only.
+    ///
+    /// Read the text with [`HostId::as_str`].
     #[must_use]
-    pub fn host_id(&self) -> Option<&str> {
+    pub fn host_id(&self) -> Option<HostId<'_>> {
         match &self.address {
-            Address::Host { host_id } => Some(host_id),
+            Address::Host { host_id } => Some(HostId::wrap_checked(host_id)),
             Address::Node { .. } | Address::Device { .. } => None,
         }
     }

@@ -6,6 +6,7 @@ use tokio::sync::oneshot;
 
 use super::delivery::DeliveryTracker;
 use super::eventloop::Health;
+use super::seq::SeqCounters;
 use super::topic::Namespace;
 use super::types::Role;
 
@@ -51,6 +52,8 @@ pub struct SparkplugClient {
     namespace: Namespace,
     node_id: Arc<str>,
     delivery: Arc<DeliveryTracker>,
+    /// The `seq` count of each edge node this client publishes for.
+    seq: Arc<SeqCounters>,
     health: tokio::sync::watch::Sender<Health>,
     role: Role,
     event_loop_handle: tokio::task::JoinHandle<()>,
@@ -146,6 +149,7 @@ impl SparkplugClient {
             namespace,
             node_id,
             delivery,
+            seq: Arc::new(SeqCounters::new()),
             health,
             role,
             event_loop_handle,

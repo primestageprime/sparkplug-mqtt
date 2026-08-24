@@ -6,9 +6,13 @@
 use super::publish::{proto_metrics, publish_with_options, record_around_publish};
 use super::shutdown::{Disconnected, disconnect_outcome, shutdown_outcome, wait_for_disconnect};
 use super::*;
-use crate::sparkplug::ids::{DeviceId, EdgeNodeId, GroupId};
 use crate::sparkplug::topic::SparkplugTopic;
+use crate::sparkplug::topic::ids::{DeviceId, EdgeNodeId, GroupId, HostId};
 use crate::sparkplug::types::{MessageType, MetricValue, wire_options};
+
+/// What `seq` reaches the wire. Its own file, so this one stays under the
+/// module size limit.
+mod seq;
 
 #[tokio::test]
 async fn a_publish_is_counted_before_the_client_sees_it() {
@@ -214,6 +218,7 @@ fn wired(role: Role) -> (SparkplugClient, flume::Receiver<rumqttc::Request>) {
         namespace: Namespace::sparkplug_b(),
         node_id: Arc::from("edge1"),
         delivery: Arc::new(DeliveryTracker::new()),
+        seq: Arc::new(SeqCounters::new()),
         health,
         role,
         event_loop_handle: tokio::spawn(std::future::pending::<()>()),
@@ -283,7 +288,7 @@ async fn an_edge_node_client_sends_data_at_qos_zero_and_counts_nothing() {
     assert_eq!(
         publish.qos,
         rumqttc::QoS::AtMostOnce,
-        "DDATA takes QoS 0 under the spec"
+        "DDATA takes QoS 0 under the specification"
     );
     assert!(!publish.retain);
     assert_eq!(
@@ -317,9 +322,9 @@ async fn an_untracked_publish_leaves_flush_with_nothing_to_wait_for() {
 #[tokio::test]
 async fn the_publish_path_reads_the_message_type_from_the_topic() {
     // NCMD is a node message and carries metrics, which is how a host
-    // application sends `Node Control/Rebirth`. Under the spec it takes
-    // QoS 0, the same as DDATA — so this proves the options come from the
-    // topic rather than from a constant on the data path.
+    // application sends `Node Control/Rebirth`. Under the specification it
+    // takes QoS 0, the same as DDATA — so this proves the options come from
+    // the topic rather than from a constant on the data path.
     let (client, requests) = wired(Role::EdgeNode);
     let topic = client.namespace().ncmd(
         GroupId::new("PlantFloor").expect("group id"),
