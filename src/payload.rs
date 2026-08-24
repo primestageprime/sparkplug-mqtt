@@ -10,70 +10,6 @@ pub fn decode_payload(bytes: &[u8]) -> Result<Payload, prost::DecodeError> {
     Payload::decode(bytes)
 }
 
-#[must_use]
-pub fn encode_type(type_str: &str) -> u32 {
-    match type_str.to_uppercase().as_str() {
-        "INT8" => 1,
-        "INT16" => 2,
-        "INT32" | "INT" => 3,
-        "INT64" | "LONG" => 4,
-        "UINT8" => 5,
-        "UINT16" => 6,
-        "UINT32" => 7,
-        "UINT64" => 8,
-        "FLOAT" => 9,
-        "DOUBLE" => 10,
-        "BOOLEAN" => 11,
-        "STRING" => 12,
-        "DATETIME" => 13,
-        "TEXT" => 14,
-        "UUID" => 15,
-        "DATASET" => 16,
-        "BYTES" => 17,
-        "FILE" => 18,
-        "TEMPLATE" => 19,
-        "PROPERTYSET" => 20,
-        "PROPERTYSETLIST" => 21,
-        _ => 0,
-    }
-}
-
-/// Decode SparkplugB datatype number to human-readable name
-///
-/// # Arguments
-/// * `datatype` - SparkplugB datatype number
-///
-/// # Returns
-/// Human-readable string name for the datatype
-#[must_use]
-pub fn decode_type(datatype: u32) -> &'static str {
-    match datatype {
-        0 => "Unknown",
-        1 => "Int8",
-        2 => "Int16",
-        3 => "Int32",
-        4 => "Int64",
-        5 => "UInt8",
-        6 => "UInt16",
-        7 => "UInt32",
-        8 => "UInt64",
-        9 => "Float32",
-        10 => "Float64",
-        11 => "Boolean",
-        12 => "String",
-        13 => "DateTime",
-        14 => "Text",
-        15 => "UUID",
-        16 => "DataSet",
-        17 => "Bytes",
-        18 => "File",
-        19 => "Template",
-        20 => "PropertySet",
-        21 => "PropertySetList",
-        _ => "Unknown",
-    }
-}
-
 impl Metric {
     /// Extract numeric value from a SparkplugB metric for plotting
     ///
@@ -128,34 +64,99 @@ impl Metric {
 mod tests {
     use super::*;
 
-    #[test]
-    fn encode_type_known_types() {
-        assert_eq!(encode_type("DOUBLE"), 10);
-        assert_eq!(encode_type("STRING"), 12);
-        assert_eq!(encode_type("BOOLEAN"), 11);
-        assert_eq!(encode_type("INT64"), 4);
-        assert_eq!(encode_type("FLOAT"), 9);
-        assert_eq!(encode_type("INT32"), 3);
+    fn metric_with(value: metric::Value) -> Metric {
+        Metric {
+            value: Some(value),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn encode_type_unknown_returns_zero() {
-        assert_eq!(encode_type("GARBAGE"), 0);
-        assert_eq!(encode_type(""), 0);
+    fn numeric_value_reads_every_number_variant() {
+        assert_eq!(
+            metric_with(metric::Value::IntValue(7)).numeric_value(),
+            Some(7.0)
+        );
+        assert_eq!(
+            metric_with(metric::Value::LongValue(7)).numeric_value(),
+            Some(7.0)
+        );
+        assert_eq!(
+            metric_with(metric::Value::FloatValue(7.5)).numeric_value(),
+            Some(7.5)
+        );
+        assert_eq!(
+            metric_with(metric::Value::DoubleValue(7.5)).numeric_value(),
+            Some(7.5)
+        );
     }
 
     #[test]
-    fn decode_type_known_types() {
-        assert_eq!(decode_type(10), "Float64");
-        assert_eq!(decode_type(12), "String");
-        assert_eq!(decode_type(11), "Boolean");
-        assert_eq!(decode_type(4), "Int64");
-        assert_eq!(decode_type(9), "Float32");
+    fn numeric_value_reads_a_boolean_as_one_or_zero() {
+        assert_eq!(
+            metric_with(metric::Value::BooleanValue(true)).numeric_value(),
+            Some(1.0)
+        );
+        assert_eq!(
+            metric_with(metric::Value::BooleanValue(false)).numeric_value(),
+            Some(0.0)
+        );
     }
 
     #[test]
-    fn decode_type_unknown_returns_unknown() {
-        assert_eq!(decode_type(0), "Unknown");
-        assert_eq!(decode_type(999), "Unknown");
+    fn numeric_value_rejects_what_it_cannot_plot() {
+        // amygdala-rs gates on this None to fall through to its string path,
+        // so a String that returned a number would change what it stores.
+        assert_eq!(
+            metric_with(metric::Value::StringValue("AUTO".to_owned())).numeric_value(),
+            None
+        );
+        assert_eq!(
+            metric_with(metric::Value::BytesValue(vec![1, 2])).numeric_value(),
+            None
+        );
+        assert_eq!(Metric::default().numeric_value(), None);
+    }
+
+    #[test]
+    fn format_value_quotes_a_string_and_leaves_a_number_bare() {
+        assert_eq!(
+            metric_with(metric::Value::StringValue("AUTO".to_owned())).format_value(),
+            "\"AUTO\""
+        );
+        assert_eq!(
+            metric_with(metric::Value::DoubleValue(7.5)).format_value(),
+            "7.5"
+        );
+        assert_eq!(
+            metric_with(metric::Value::BooleanValue(true)).format_value(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn format_value_says_so_when_there_is_no_value() {
+        assert_eq!(Metric::default().format_value(), "No value");
+    }
+
+    #[test]
+    fn decode_payload_reads_back_what_was_encoded() {
+        let payload = Payload {
+            timestamp: Some(1_700_000_000_000),
+            metrics: vec![Metric {
+                name: Some("temperature".to_owned()),
+                value: Some(metric::Value::DoubleValue(42.5)),
+                datatype: Some(10),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let decoded = decode_payload(&payload.encode_to_vec()).expect("should decode payload");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn decode_payload_rejects_bytes_that_are_not_a_payload() {
+        assert!(decode_payload(&[0xff, 0xff, 0xff, 0xff]).is_err());
     }
 }

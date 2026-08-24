@@ -14,6 +14,11 @@
 - `Metric::decode_value_to_string` is removed. It dispatched to the function
   above for a `bytes_value` and to `format_value` for everything else. Call
   `Metric::format_value`, which reads the protobuf variants directly.
+- `encode_type` and `decode_type` are removed, with their crate re-exports.
+  They held the datatype table twice, in opposite directions, with nothing
+  keeping the two in step. `encode_type` took a string, so a misspelt name
+  returned `0` — Unknown — and nothing reported it. Use `DataType` below.
+  Neither function had a caller outside this crate.
 
 `Metric::numeric_value` and `Metric::format_value` are unchanged.
 
@@ -32,6 +37,11 @@
   confirming anything.
 - `DEFAULT_CONNECT_TIMEOUT` is now public, so the wait `connect` uses can be
   named when calling `connect_as`.
+- `DataType`, an enum of the 21 datatypes the Sparkplug B specification
+  numbers. `DataType::code` writes the wire number and `DataType::from_code`
+  reads one back, returning `None` for a number no datatype claims. One
+  table generates both directions, so adding a datatype is one line. This
+  unblocks G10 of `docs/sparkplug-conformance-gaps.md`.
 
 ### Changed
 

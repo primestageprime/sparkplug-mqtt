@@ -1,5 +1,5 @@
+use super::datatype::DataType;
 use crate::error::SparkplugError;
-use crate::payload::encode_type;
 use crate::payload::payload::metric;
 use std::str::FromStr;
 
@@ -18,16 +18,18 @@ pub enum MetricValue {
 }
 
 impl MetricValue {
-    /// Convert to the protobuf `metric::Value` and its datatype code.
+    /// Convert to the protobuf `metric::Value` and its [`DataType`].
+    ///
+    /// The variant fixes the datatype, so this match is the only place the
+    /// two are paired. A wrong pairing is a compile error rather than a
+    /// datatype the receiver cannot read.
     #[must_use]
-    pub(super) fn to_proto(&self) -> (metric::Value, u32) {
+    pub(super) fn to_proto(&self) -> (metric::Value, DataType) {
         match self {
-            MetricValue::Float(v) => (metric::Value::DoubleValue(*v), encode_type("DOUBLE")),
-            MetricValue::String(v) => {
-                (metric::Value::StringValue(v.clone()), encode_type("STRING"))
-            }
-            MetricValue::Bool(v) => (metric::Value::BooleanValue(*v), encode_type("BOOLEAN")),
-            MetricValue::Int(v) => (metric::Value::LongValue(*v), encode_type("UINT64")),
+            MetricValue::Float(v) => (metric::Value::DoubleValue(*v), DataType::Double),
+            MetricValue::String(v) => (metric::Value::StringValue(v.clone()), DataType::String),
+            MetricValue::Bool(v) => (metric::Value::BooleanValue(*v), DataType::Boolean),
+            MetricValue::Int(v) => (metric::Value::LongValue(*v), DataType::UInt64),
         }
     }
 }
