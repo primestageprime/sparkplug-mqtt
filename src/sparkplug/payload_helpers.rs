@@ -9,7 +9,7 @@ pub fn create_metric(name: impl Into<String>, value: MetricValue) -> Metric {
     Metric {
         name: Some(name.into()),
         value: Some(proto_value),
-        datatype: Some(datatype),
+        datatype: Some(datatype.code()),
         timestamp: Some(Timestamp::now().0),
         ..Default::default()
     }
@@ -60,14 +60,14 @@ pub fn create_device_birth_certificate() -> crate::payload::Payload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payload::encode_type;
     use crate::payload::payload::metric;
+    use crate::sparkplug::DataType;
 
     #[test]
     fn create_metric_float() {
         let m = create_metric("temp", MetricValue::Float(42.5));
         assert_eq!(m.value, Some(metric::Value::DoubleValue(42.5)));
-        assert_eq!(m.datatype, Some(encode_type("DOUBLE")));
+        assert_eq!(m.datatype, Some(DataType::Double.code()));
     }
 
     #[test]
@@ -77,21 +77,21 @@ mod tests {
             m.value,
             Some(metric::Value::StringValue("AUTO".to_string()))
         );
-        assert_eq!(m.datatype, Some(encode_type("STRING")));
+        assert_eq!(m.datatype, Some(DataType::String.code()));
     }
 
     #[test]
     fn create_metric_bool() {
         let m = create_metric("active", MetricValue::Bool(true));
         assert_eq!(m.value, Some(metric::Value::BooleanValue(true)));
-        assert_eq!(m.datatype, Some(encode_type("BOOLEAN")));
+        assert_eq!(m.datatype, Some(DataType::Boolean.code()));
     }
 
     #[test]
     fn create_metric_int() {
         let m = create_metric("count", MetricValue::Int(99));
         assert_eq!(m.value, Some(metric::Value::LongValue(99)));
-        assert_eq!(m.datatype, Some(encode_type("UINT64")));
+        assert_eq!(m.datatype, Some(DataType::UInt64.code()));
     }
 
     #[test]

@@ -51,7 +51,7 @@ impl SparkplugClient {
         let metric = Metric {
             name: Some(metric_name.to_string()),
             value: Some(proto_value),
-            datatype: Some(datatype),
+            datatype: Some(datatype.code()),
             timestamp: Some(timestamp_ms),
             ..Default::default()
         };
@@ -167,7 +167,7 @@ impl SparkplugClient {
         let metric = Metric {
             name: Some(metric_name.to_string()),
             value: Some(proto_value),
-            datatype: Some(datatype),
+            datatype: Some(datatype.code()),
             timestamp: Some(timestamp_ms),
             ..Default::default()
         };
@@ -262,7 +262,7 @@ pub(super) fn proto_metrics(metrics: Vec<(String, MetricValue, u64)>) -> Vec<Met
             Metric {
                 name: Some(name),
                 value: Some(proto_value),
-                datatype: Some(datatype),
+                datatype: Some(datatype.code()),
                 timestamp: Some(ts),
                 ..Default::default()
             }

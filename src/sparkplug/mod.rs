@@ -1,4 +1,5 @@
 mod client;
+mod datatype;
 mod delivery;
 mod eventloop;
 mod ids;
@@ -7,6 +8,7 @@ mod topic;
 mod types;
 
 pub use client::{DEFAULT_CONNECT_TIMEOUT, SparkplugClient};
+pub use datatype::DataType;
 pub use delivery::{DeliveryTracker, PublishTicket};
 pub use eventloop::Health;
 pub use ids::{DeviceId, EdgeNodeId, GroupId, HostId};
