@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- `decode_metric_value_to_string` is removed, with its crate re-export. It
+  decoded big-endian bytes for Int8 through String, which protobuf already
+  carries as typed `oneof` variants. Its only caller reached it when the
+  value was `bytes_value`, and the specification fills that field for Bytes
+  and File alone — so its Int, Float and Boolean arms either never ran or
+  misread their input. This closes G13 of
+  `docs/sparkplug-conformance-gaps.md`.
+- `Metric::decode_value_to_string` is removed. It dispatched to the function
+  above for a `bytes_value` and to `format_value` for everything else. Call
+  `Metric::format_value`, which reads the protobuf variants directly.
+
+`Metric::numeric_value` and `Metric::format_value` are unchanged.
+
 ## 0.4.0
 
 A breaking release. `connect`, `publish_metric`, `publish_metrics`, and

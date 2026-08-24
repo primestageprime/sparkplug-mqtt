@@ -40,10 +40,7 @@ pub mod util;
 // Re-export commonly used types
 pub use client::{MqttConfig, generate_client_id, mqtt_options, mqtt_parts, tls_transport};
 pub use error::SparkplugError;
-pub use payload::{
-    Metric, Payload, decode_metric_value_to_string, decode_payload, decode_type, encode_type,
-    metric,
-};
+pub use payload::{Metric, Payload, decode_payload, decode_type, encode_type, metric};
 pub use sparkplug::{
     DeliveryTracker, DeviceId, EdgeNodeId, GroupId, Health, HostId, MessageType, MetricValue,
     Namespace, PublishTicket, Shape, SparkplugClient, SparkplugTopic, Timestamp,
