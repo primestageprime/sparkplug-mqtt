@@ -35,7 +35,6 @@ pub mod error;
 #[allow(clippy::module_inception)]
 pub mod payload;
 pub mod sparkplug;
-pub mod util;
 
 // Re-export commonly used types
 pub use client::{MqttConfig, generate_client_id, mqtt_options, mqtt_parts, tls_transport};

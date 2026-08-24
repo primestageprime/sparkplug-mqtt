@@ -223,13 +223,27 @@ pub(super) fn wire_options(role: Role, message_type: MessageType) -> WireOptions
 // Timestamp
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A Sparkplug timestamp: milliseconds since the Unix epoch.
+///
+/// This is the only route to the clock in the crate. Every payload builder
+/// takes one rather than reading the clock itself, so a test can state the
+/// instant it expects instead of asserting the value is above zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp(pub u64);
 
 impl Timestamp {
+    /// Read the clock now.
+    ///
+    /// A clock before the Unix epoch gives 0, which the broker reads as an
+    /// unset timestamp. No supported platform reports one.
     #[must_use]
     pub fn now() -> Self {
-        Self(crate::util::get_current_timestamp())
+        Self(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        )
     }
 }
 
