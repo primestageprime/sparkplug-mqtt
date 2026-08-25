@@ -5,8 +5,15 @@
 //!
 //! # Quick start
 //!
+//! A client connects in one of two roles. A publisher client takes the edge
+//! node of each publish per call. An edge node client names one edge node at
+//! connect, and it is the client that announces a birth.
+//!
 //! ```rust,no_run
-//! use sparkplug_mqtt::{MqttConfig, SparkplugClient, MetricValue};
+//! use sparkplug_mqtt::{
+//!     DEFAULT_CONNECT_TIMEOUT, DeviceId, EdgeNode, EdgeNodeId, GroupId, MetricValue, MqttConfig,
+//!     SparkplugClient,
+//! };
 //! use rumqttc::Transport;
 //!
 //! # async fn example() -> Result<(), sparkplug_mqtt::SparkplugError> {
@@ -16,13 +23,20 @@
 //!     transport: Transport::Tcp,
 //!     username: "user".to_owned(),
 //!     password: "pass".to_owned(),
-//!     group_id: "MyGroup".to_owned(),
-//!     node_id: "node1".to_owned(),
+//!     // `None` takes a generated client id. The client id names this MQTT
+//!     // connection, and it names no edge node.
+//!     client_id: None,
 //!     version: "spBv1.0".to_owned(),
 //! };
 //!
-//! let client = SparkplugClient::connect(&config).await?;
-//! client.publish_birth("MyGroup", "device1").await?;
+//! // This client speaks for one edge node: the group and the node below.
+//! let edge_node = EdgeNode::new(GroupId::new("MyGroup")?, EdgeNodeId::new("node1")?);
+//! let client =
+//!     SparkplugClient::connect_as_edge_node(&config, edge_node, DEFAULT_CONNECT_TIMEOUT).await?;
+//!
+//! // The birth names that edge node, so the births and the data below share
+//! // one seq count.
+//! client.publish_birth(DeviceId::new("device1")?).await?;
 //! client
 //!     .publish_metric("MyGroup", "node1", "device1", "temperature", MetricValue::Float(23.5), 0)
 //!     .await?;
@@ -41,9 +55,9 @@ pub use client::{MqttConfig, generate_client_id, mqtt_options, mqtt_parts, tls_t
 pub use error::SparkplugError;
 pub use payload::{Metric, Payload, decode_payload, metric};
 pub use sparkplug::{
-    DEFAULT_CONNECT_TIMEOUT, DataType, DeliveryTracker, DeviceId, EdgeNodeId, GroupId, Health,
-    HostId, MessageType, MetricValue, Namespace, PublishTicket, Role, Shape, SparkplugClient,
-    SparkplugTopic, Timestamp,
+    DEFAULT_CONNECT_TIMEOUT, DataType, DeliveryTracker, DeviceId, EdgeNode, EdgeNodeId, GroupId,
+    Health, HostId, MessageType, MetricValue, Namespace, PublishTicket, Role, Shape,
+    SparkplugClient, SparkplugTopic, Timestamp,
 };
 
 // Re-export rumqttc types for convenience

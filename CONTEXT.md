@@ -55,8 +55,21 @@ _Avoid_: host name, application id, consumer id
 **Client id**:
 The MQTT-level identifier for one connection. Distinct from an edge node —
 one process may open several connections, each needing its own client id,
-without any of them being an edge node.
+without any of them being an edge node. It lives on `MqttConfig` as
+`client_id`, and it reaches the CONNECT packet alone: no topic segment ever
+carries it. Leave it unset to take a generated one.
 _Avoid_: node id, connection name
+
+**Edge node identity**:
+The group and the edge node id that name the one edge node a client speaks
+for. The public type is `EdgeNode`, a checked pair that borrows, and a
+client takes it at connect through `connect_as_edge_node`. The client stores
+the owned form, `OwnedEdgeNode`, which is crate-internal and takes an
+`EdgeNode` alone — so the edge node role cannot hold a segment that failed
+its check. The identity is fixed for the session: every birth the client
+announces names it. A publisher client holds none, so it announces no birth
+— `publish_birth` reports `NotAnEdgeNode`.
+_Avoid_: node id, client id, address
 
 **Host application**:
 A consumer that subscribes across the bus and reassembles state from births,
@@ -77,8 +90,9 @@ A client that runs the full Sparkplug session lifecycle for its own
 configured edge node — death registration, births, commands, and the QoS the
 specification fixes.
 
-`Role::EdgeNode` selects the QoS and the retain flag today. Every client
-also counts `seq` for each edge node it publishes for, and the pair
+`Role::EdgeNode` selects the QoS and the retain flag today, and the client
+holds the edge node identity that goes with it. Every client also counts
+`seq` for each edge node it publishes for, and the pair
 `group_id/edge_node_id` names that edge node. Death registration, `bdSeq`,
 and the rebirth after a reconnect are not implemented, so a client in that
 role is not yet a conformant edge node. The term names the destination; the role is

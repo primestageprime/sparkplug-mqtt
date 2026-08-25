@@ -9,6 +9,7 @@
 //! loop-invariant ones once and reuse them across a batch.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::error::SparkplugError;
 
@@ -74,7 +75,12 @@ macro_rules! topic_id {
             /// group and an edge node with `/` to key its counts, and that
             /// key names one edge node only while no segment holds a `/`.
             ///
-            /// [`super`] alone calls this, so the visibility stops there.
+            /// The visibility stops at the topic module, which holds every
+            /// caller: the accessors on a topic, and
+            /// [`OwnedEdgeNode`]. Outside that wall a caller reaches a
+            /// segment through `new` or through the parser, so the
+            /// `debug_assert` guards a rule the module keeps rather than a
+            /// rule the crate hopes for.
             pub(in crate::sparkplug::topic) fn wrap_checked(value: &'a str) -> Self {
                 debug_assert!(is_usable_segment(value));
                 Self(value)
@@ -134,6 +140,99 @@ topic_id!(
     "scada_1"
 );
 
+/// The pair that names one Sparkplug edge node: a group and an edge node id.
+///
+/// Sparkplug names an edge node by both segments, so the same edge node id
+/// in two groups names two edge nodes. The pair travels together to stop a
+/// caller from taking one segment from one place and the other from
+/// another.
+///
+/// A client takes this at connect and keeps it. The client id names the MQTT
+/// connection and has no part in it.
+///
+/// # Examples
+///
+/// ```
+/// use sparkplug_mqtt::{EdgeNode, EdgeNodeId, GroupId};
+///
+/// let edge_node = EdgeNode::new(GroupId::new("PlantFloor")?, EdgeNodeId::new("edge_node_1")?);
+/// assert_eq!(edge_node.group().as_str(), "PlantFloor");
+/// assert_eq!(edge_node.edge_node_id().as_str(), "edge_node_1");
+/// # Ok::<(), sparkplug_mqtt::SparkplugError>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EdgeNode<'a> {
+    group: GroupId<'a>,
+    edge_node_id: EdgeNodeId<'a>,
+}
+
+impl<'a> EdgeNode<'a> {
+    /// Name one edge node by its group and its edge node id.
+    ///
+    /// Both arguments are checked already, so this cannot fail.
+    #[must_use]
+    pub fn new(group: GroupId<'a>, edge_node_id: EdgeNodeId<'a>) -> Self {
+        Self {
+            group,
+            edge_node_id,
+        }
+    }
+
+    /// The group the edge node belongs to.
+    #[must_use]
+    pub fn group(&self) -> GroupId<'a> {
+        self.group
+    }
+
+    /// The edge node id inside that group.
+    #[must_use]
+    pub fn edge_node_id(&self) -> EdgeNodeId<'a> {
+        self.edge_node_id
+    }
+}
+
+/// The same checked pair, owned, for a holder that outlives the strings it
+/// was built from.
+///
+/// [`EdgeNode`] borrows, so a client that keeps its identity for the length
+/// of a session cannot store it. This type stores the two segments as
+/// `Arc<str>` instead.
+///
+/// The fields are private and this module holds the only constructor, which
+/// is `From<EdgeNode<'_>>`. So the two strings inside always came from
+/// [`GroupId::new`] and [`EdgeNodeId::new`], or from the parser, which
+/// checks the same way. No caller can build one from a string that skipped
+/// the check, which is what ADR-0004 rests on: a client in the edge node
+/// role holds this type, so that role cannot exist beside an unusable
+/// segment.
+///
+/// `From<&OwnedEdgeNode>` hands an [`EdgeNode`] back. It rewraps rather than
+/// checks a second time, on the rule ADR-0002 states: check a value once,
+/// where it enters its type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct OwnedEdgeNode {
+    group: Arc<str>,
+    edge_node_id: Arc<str>,
+}
+
+impl From<EdgeNode<'_>> for OwnedEdgeNode {
+    fn from(edge_node: EdgeNode<'_>) -> Self {
+        Self {
+            group: Arc::from(edge_node.group().as_str()),
+            edge_node_id: Arc::from(edge_node.edge_node_id().as_str()),
+        }
+    }
+}
+
+impl<'a> From<&'a OwnedEdgeNode> for EdgeNode<'a> {
+    fn from(owned: &'a OwnedEdgeNode) -> Self {
+        Self::new(
+            GroupId::wrap_checked(&owned.group),
+            EdgeNodeId::wrap_checked(&owned.edge_node_id),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +285,59 @@ mod tests {
         assert_eq!(id, GroupId::new("PlantFloor").unwrap());
         assert_eq!(id.to_string(), "PlantFloor");
         assert_eq!(id.as_ref(), "PlantFloor");
+    }
+
+    #[test]
+    fn an_edge_node_keeps_its_two_segments_apart() {
+        let edge_node = EdgeNode::new(
+            GroupId::new("PlantFloor").unwrap(),
+            EdgeNodeId::new("edge_node_1").unwrap(),
+        );
+        assert_eq!(edge_node.group().as_str(), "PlantFloor");
+        assert_eq!(edge_node.edge_node_id().as_str(), "edge_node_1");
+    }
+
+    #[test]
+    fn one_edge_node_id_in_two_groups_names_two_edge_nodes() {
+        let edge_node_id = EdgeNodeId::new("edge1").unwrap();
+        let plant = EdgeNode::new(GroupId::new("PlantFloor").unwrap(), edge_node_id);
+        let boiler = EdgeNode::new(GroupId::new("Boiler").unwrap(), edge_node_id);
+        assert_ne!(
+            plant, boiler,
+            "Sparkplug names an edge node by the pair, so the group must count"
+        );
+    }
+
+    #[test]
+    fn an_owned_edge_node_hands_back_the_pair_it_took() {
+        let borrowed = EdgeNode::new(
+            GroupId::new("PlantFloor").unwrap(),
+            EdgeNodeId::new("edge_node_1").unwrap(),
+        );
+        let owned = OwnedEdgeNode::from(borrowed);
+
+        assert_eq!(
+            EdgeNode::from(&owned),
+            borrowed,
+            "the owned pair must name the same edge node as the pair it took"
+        );
+    }
+
+    #[test]
+    fn an_owned_edge_node_outlives_the_strings_it_was_built_from() {
+        let owned = {
+            let group = String::from("PlantFloor");
+            let edge_node_id = String::from("edge_node_1");
+            OwnedEdgeNode::from(EdgeNode::new(
+                GroupId::new(&group).unwrap(),
+                EdgeNodeId::new(&edge_node_id).unwrap(),
+            ))
+        };
+
+        assert_eq!(EdgeNode::from(&owned).group().as_str(), "PlantFloor");
+        assert_eq!(
+            EdgeNode::from(&owned).edge_node_id().as_str(),
+            "edge_node_1"
+        );
     }
 }

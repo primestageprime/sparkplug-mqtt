@@ -4,6 +4,49 @@
 
 ### Breaking changes
 
+- `MqttConfig.node_id` and `MqttConfig.group_id` are removed, and
+  `client_id: Option<String>` takes their place. `node_id` named two things
+  at once: `generate_client_id` put it in the MQTT client id, which names one
+  connection, and `publish_birth` announced an edge node under it, which
+  names a Sparkplug entity. `publish_metric` took the edge node per call, so
+  where the two differed the births announced one edge node and the data
+  carried another — and the `seq` counts of the two ran apart, which a host
+  application reads as a gap in both streams. `group_id` only ever prefixed
+  the client id; every publish took its own group. Set `client_id` to name a
+  connection yourself, which one process with several connections must do,
+  or leave it `None` for a generated one. See ADR-0004.
+- `generate_client_id` takes `&str`, the version, rather than `&MqttConfig`,
+  and formats `{version}_{random 32-bit hex}` — for example
+  `spBv1.0_9f3c1ba7`. The group and the edge node left the config, so neither
+  can prefix a client id, and `version` is the same string for every caller.
+  The suffix therefore carries all of the difference between two generated
+  ids. A broker reads two connections with one client id as a takeover and
+  disconnects the earlier session, which the event loop then reconnects.
+  `mqtt_options` calls this only when `client_id` is `None`.
+- `SparkplugClient::connect_as(config, role, timeout)` is removed. It is
+  unreleased — the entry below adds it — and it could reach `Role::EdgeNode`
+  with no edge node beside it, which is the state ADR-0004 removes.
+  `connect_as_edge_node(config, edge_node, timeout)` replaces it and takes
+  the identity the role needs. `connect` and `connect_with_timeout` keep
+  their signatures and their behaviour.
+- `SparkplugClient::publish_birth` takes one argument, `DeviceId<'_>`. The
+  group and the edge node come from the identity the client took at connect,
+  so the births and the data of that edge node name one edge node and draw
+  from one `seq` count. A client that connected as a publisher owns no edge
+  node and returns the new `SparkplugError::NotAnEdgeNode`. That stays a
+  runtime check: refusing the call at compile time needs the client-type
+  split ADR-0003 deferred.
+- `EdgeNode` is a new public type: the checked pair of a `GroupId` and an
+  `EdgeNodeId` that names one edge node, read back through `group()` and
+  `edge_node_id()`. `connect_as_edge_node` takes it. Sparkplug names an edge
+  node by both segments, so the pair travels as one value — the same
+  reasoning ADR-0002 gives for `GroupId` and `EdgeNodeId` themselves. A
+  client in the edge node role stores that pair and nothing weaker, so no
+  route in the crate reaches that role with a segment that failed the
+  check.
+- `SparkplugError::NotAnEdgeNode` is a new variant. The enum is
+  `#[non_exhaustive]`, so a caller that matches with a wildcard arm needs no
+  change.
 - `decode_metric_value_to_string` is removed, with its crate re-export. It
   decoded big-endian bytes for Int8 through String, which protobuf already
   carries as typed `oneof` variants. Its only caller reached it when the
@@ -85,16 +128,17 @@
 - `Role`, with the variants `Publisher` and `EdgeNode`. It is fixed when a
   client connects and decides the QoS and the retain flag of every publish,
   and with them whether `flush` can confirm a message. See ADR-0003.
-- `SparkplugClient::connect_as(config, role, timeout)`. `connect` and
-  `connect_with_timeout` keep their signatures and delegate to it with
-  `Role::Publisher`, so no existing caller changes behaviour.
+- `SparkplugClient::connect_as_edge_node(config, edge_node, timeout)`, which
+  connects in `Role::EdgeNode` for the edge node named there. `connect` and
+  `connect_with_timeout` keep their signatures and connect as a publisher,
+  so no existing caller changes behaviour.
 - `SparkplugClient::tracks_delivery`. It reports whether `flush` can confirm
   what this client publishes. Assert it once at startup before gating a
   durable write on `flush`. A `Role::EdgeNode` client publishes at QoS 0,
   which the broker never acknowledges, so its `flush` returns `Ok` without
   confirming anything.
 - `DEFAULT_CONNECT_TIMEOUT` is now public, so the wait `connect` uses can be
-  named when calling `connect_as`.
+  named when calling `connect_as_edge_node`.
 - `DataType`, an enum of the 21 datatypes the Sparkplug B specification
   numbers. `DataType::code` writes the wire number and `DataType::from_code`
   reads one back, returning `None` for a number no datatype claims. One
@@ -110,6 +154,13 @@
 - The delivery tracker no longer counts a publish the broker will not
   acknowledge. Its own documentation asked for this — "Do not call this for
   QoS 0" — and nothing enforced it.
+- Both GitHub workflows now start an `eclipse-mosquitto:2` container and run
+  `cargo test -- --ignored`. The broker-backed tests in `tests/delivery.rs`
+  carry `#[ignore]`, so a bare `cargo test` skipped them, and one of them
+  holds the only proof that a birth names the edge node of the connect call
+  on a real bus.
+- The listener in `tests/delivery.rs` takes a random client id. It used a
+  fixed one, so two overlapping runs disconnected each other.
 
 This does not close G4 of the conformance audit. Every client that exists
 today is a `Role::Publisher` and still publishes at QoS 1. G4 closes when an

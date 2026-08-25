@@ -6,6 +6,7 @@
 use super::publish::{proto_metrics, publish_with_options, record_around_publish};
 use super::shutdown::{Disconnected, disconnect_outcome, shutdown_outcome, wait_for_disconnect};
 use super::*;
+use crate::client::mqtt_options;
 use crate::sparkplug::topic::SparkplugTopic;
 use crate::sparkplug::topic::ids::{DeviceId, EdgeNodeId, GroupId, HostId};
 use crate::sparkplug::types::{MessageType, MetricValue, wire_options};
@@ -209,22 +210,56 @@ fn a_bad_namespace_fails_the_connect_rather_than_every_publish() {
 /// Build a client whose publishes land in a channel instead of a socket.
 ///
 /// The event loop task parks forever. `Drop` aborts it, so nothing leaks.
-fn wired(role: Role) -> (SparkplugClient, flume::Receiver<rumqttc::Request>) {
+///
+/// This builds the struct field by field, which is the widest route into a
+/// client that the crate has. The identity is a field, and the edge node
+/// variant holds `OwnedEdgeNode`, so this route reaches the edge node role
+/// only with a checked edge node beside it — a constructor alone could not
+/// state that.
+fn wired(identity: Identity) -> (SparkplugClient, flume::Receiver<rumqttc::Request>) {
     let (tx, rx) = flume::bounded(16);
     let (health, _) = tokio::sync::watch::channel(Health::Disconnected);
 
     let client = SparkplugClient {
         client: rumqttc::AsyncClient::from_senders(tx),
         namespace: Namespace::sparkplug_b(),
-        node_id: Arc::from("edge1"),
+        identity,
         delivery: Arc::new(DeliveryTracker::new()),
         seq: Arc::new(SeqCounters::new()),
         health,
-        role,
         event_loop_handle: tokio::spawn(std::future::pending::<()>()),
     };
 
     (client, rx)
+}
+
+/// Build a wired client that borrows the edge node of every publish.
+fn wired_publisher() -> (SparkplugClient, flume::Receiver<rumqttc::Request>) {
+    wired(Identity::Publisher)
+}
+
+/// Name one edge node from two literals, checking both segments.
+///
+/// Each test names its edge node inline, and this is the only route from a
+/// literal to the pair. A literal that cannot stand as a topic segment
+/// fails the check here and the test panics, so no test can reach the
+/// client with one.
+fn edge_node_named<'a>(group: &'a str, edge_node_id: &'a str) -> EdgeNode<'a> {
+    EdgeNode::new(
+        GroupId::new(group).expect("group id"),
+        EdgeNodeId::new(edge_node_id).expect("edge node id"),
+    )
+}
+
+/// Build a wired client that speaks for `edge_node`.
+///
+/// The argument is the checked pair, and `Identity::EdgeNode` holds the
+/// owned form of it. So this route — the widest one into a client — cannot
+/// reach the edge node role with a segment that no check passed.
+fn wired_edge_node(
+    edge_node: EdgeNode<'_>,
+) -> (SparkplugClient, flume::Receiver<rumqttc::Request>) {
+    wired(Identity::EdgeNode(edge_node.into()))
 }
 
 fn ddata_topic(client: &SparkplugClient) -> SparkplugTopic {
@@ -248,7 +283,7 @@ fn sent(requests: &flume::Receiver<rumqttc::Request>) -> rumqttc::Publish {
 
 #[tokio::test]
 async fn a_publisher_client_sends_data_at_qos_one_and_counts_it() {
-    let (client, requests) = wired(Role::Publisher);
+    let (client, requests) = wired_publisher();
 
     client
         .publish_metric_to(
@@ -272,7 +307,7 @@ async fn a_publisher_client_sends_data_at_qos_one_and_counts_it() {
 
 #[tokio::test]
 async fn an_edge_node_client_sends_data_at_qos_zero_and_counts_nothing() {
-    let (client, requests) = wired(Role::EdgeNode);
+    let (client, requests) = wired_edge_node(edge_node_named("PlantFloor", "edge_node_1"));
 
     client
         .publish_metric_to(
@@ -301,7 +336,7 @@ async fn an_edge_node_client_sends_data_at_qos_zero_and_counts_nothing() {
 
 #[tokio::test]
 async fn an_untracked_publish_leaves_flush_with_nothing_to_wait_for() {
-    let (client, _requests) = wired(Role::EdgeNode);
+    let (client, _requests) = wired_edge_node(edge_node_named("PlantFloor", "edge_node_1"));
 
     client
         .publish_metric_to(
@@ -325,7 +360,7 @@ async fn the_publish_path_reads_the_message_type_from_the_topic() {
     // application sends `Node Control/Rebirth`. Under the specification it
     // takes QoS 0, the same as DDATA — so this proves the options come from
     // the topic rather than from a constant on the data path.
-    let (client, requests) = wired(Role::EdgeNode);
+    let (client, requests) = wired_edge_node(edge_node_named("PlantFloor", "edge_node_1"));
     let topic = client.namespace().ncmd(
         GroupId::new("PlantFloor").expect("group id"),
         EdgeNodeId::new("edge_node_1").expect("edge node id"),
@@ -343,8 +378,8 @@ async fn the_publish_path_reads_the_message_type_from_the_topic() {
 
 #[tokio::test]
 async fn tracks_delivery_reports_the_role() {
-    let (publisher, _p) = wired(Role::Publisher);
-    let (edge_node, _e) = wired(Role::EdgeNode);
+    let (publisher, _p) = wired_publisher();
+    let (edge_node, _e) = wired_edge_node(edge_node_named("PlantFloor", "edge_node_1"));
 
     assert!(
         publisher.tracks_delivery(),
@@ -376,4 +411,68 @@ async fn an_untracked_publish_that_the_client_refuses_still_reports_the_error() 
         "a refused publish must reach the caller even when it is untracked"
     );
     assert_eq!(delivery.unacked(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The edge node an identity names
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_birth_names_the_edge_node_given_at_connect_not_the_client_id() {
+    // A client id names one MQTT connection. An edge node names a Sparkplug
+    // entity. This connection and this edge node carry different names, and
+    // the NBIRTH must carry the edge node.
+    let config = crate::client::MqttConfig {
+        broker_url: "localhost".to_owned(),
+        broker_port: 1883,
+        transport: rumqttc::Transport::Tcp,
+        username: String::new(),
+        password: String::new(),
+        client_id: Some("stax-publisher-7".to_owned()),
+        version: "spBv1.0".to_owned(),
+    };
+    assert_eq!(
+        mqtt_options(&config).client_id(),
+        "stax-publisher-7",
+        "the client id reaches the MQTT options and stops there"
+    );
+
+    let (client, requests) = wired_edge_node(edge_node_named("PlantFloor", "edge_node_1"));
+    client
+        .publish_birth(DeviceId::new("pump_3").expect("device id"))
+        .await
+        .expect("the births must be accepted");
+
+    let nbirth = sent(&requests);
+    assert_eq!(
+        nbirth.topic, "spBv1.0/PlantFloor/NBIRTH/edge_node_1",
+        "the birth must name the edge node the client took at connect"
+    );
+    assert!(
+        !nbirth.topic.contains("stax-publisher-7"),
+        "the client id must reach no topic segment"
+    );
+
+    let dbirth = sent(&requests);
+    assert_eq!(dbirth.topic, "spBv1.0/PlantFloor/DBIRTH/edge_node_1/pump_3");
+}
+
+#[tokio::test]
+async fn a_publisher_client_cannot_announce_a_birth() {
+    // A publisher client borrows the edge node of each publish and owns
+    // none, so it has no edge node to announce.
+    let (client, requests) = wired_publisher();
+
+    let refused = client
+        .publish_birth(DeviceId::new("pump_3").expect("device id"))
+        .await;
+
+    assert!(
+        matches!(refused, Err(SparkplugError::NotAnEdgeNode)),
+        "a publisher client must refuse a birth, got: {refused:?}"
+    );
+    assert!(
+        requests.try_recv().is_err(),
+        "a refused birth must reach no wire"
+    );
 }

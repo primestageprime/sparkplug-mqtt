@@ -21,3 +21,31 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+      # The broker-backed tests in `tests/delivery.rs` carry `#[ignore]`, so
+      # the run above skips them. They hold the only proof that a birth names
+      # the edge node of the connect call on a real bus, so CI must run them.
+      #
+      # Mosquitto 2 refuses an anonymous client until a config file allows
+      # one. A `services:` block starts a container before any step can write
+      # that file, so this step starts the broker itself.
+      - name: Start an MQTT broker
+        run: |
+          docker run -d --rm --name sparkplug-ci-broker -p 1883:1883 eclipse-mosquitto:2 \
+            sh -c 'printf "listener 1883\nallow_anonymous true\n" > /m.conf && mosquitto -c /m.conf'
+          for _ in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/1883) 2>/dev/null; then
+              echo "the broker accepts connections"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the broker did not open port 1883 within 30 s" >&2
+          docker logs sparkplug-ci-broker
+          exit 1
+
+      - run: cargo test -- --ignored
+
+      - name: Stop the MQTT broker
+        if: always()
+        run: docker stop sparkplug-ci-broker

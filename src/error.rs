@@ -79,6 +79,16 @@ pub enum SparkplugError {
     #[error("shutdown could not confirm the DISCONNECT packet within {after:?}")]
     ShutdownTimeout { after: Duration },
 
+    /// The client connected as a publisher, so it owns no edge node.
+    ///
+    /// A publisher client takes the edge node of each publish per call and
+    /// owns none of them. Only an edge node client announces a birth, and it
+    /// announces the edge node it named at connect. Connect through
+    /// [`SparkplugClient::connect_as_edge_node`](crate::SparkplugClient::connect_as_edge_node)
+    /// to get such a client.
+    #[error("this client connected as a publisher, so it owns no edge node to announce")]
+    NotAnEdgeNode,
+
     /// `flush` gave up waiting for the broker to acknowledge.
     #[error("flush timed out after {after:?} with {unacked} publish(es) unacknowledged")]
     FlushTimeout { after: Duration, unacked: u32 },

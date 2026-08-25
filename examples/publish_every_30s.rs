@@ -5,7 +5,10 @@
 //!
 //! Requires an MQTT broker running on localhost:1883.
 
-use sparkplug_mqtt::{MetricValue, MqttConfig, SparkplugClient};
+use sparkplug_mqtt::{
+    DEFAULT_CONNECT_TIMEOUT, DeviceId, EdgeNode, EdgeNodeId, GroupId, MetricValue, MqttConfig,
+    SparkplugClient,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[tokio::main]
@@ -18,14 +21,17 @@ async fn main() -> Result<(), sparkplug_mqtt::SparkplugError> {
         transport: rumqttc::Transport::Tcp,
         username: String::new(),
         password: String::new(),
-        group_id: "Example".to_owned(),
-        node_id: "example-node".to_owned(),
+        client_id: None,
         version: "spBv1.0".to_owned(),
     };
 
-    let client = SparkplugClient::connect(&config).await?;
+    // The config names the MQTT connection. This pair names the edge node
+    // this client speaks for, and every birth below announces it.
+    let edge_node = EdgeNode::new(GroupId::new("Example")?, EdgeNodeId::new("example-node")?);
+    let client =
+        SparkplugClient::connect_as_edge_node(&config, edge_node, DEFAULT_CONNECT_TIMEOUT).await?;
 
-    client.publish_birth("Example", "sensor1").await?;
+    client.publish_birth(DeviceId::new("sensor1")?).await?;
     println!("Published birth certificates for sensor1");
 
     loop {
