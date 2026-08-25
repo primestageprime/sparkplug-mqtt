@@ -7,7 +7,6 @@
 use prost::Message;
 
 use crate::error::SparkplugError;
-use crate::payload::Payload;
 use crate::payload::payload::Metric;
 
 use super::SparkplugClient;
@@ -15,6 +14,7 @@ use crate::sparkplug::delivery::DeliveryTracker;
 use crate::sparkplug::payload_helpers::{
     create_birth_certificate, create_device_birth_certificate, create_metric, create_payload,
 };
+use crate::sparkplug::seq::SeqReservation;
 use crate::sparkplug::topic::SparkplugTopic;
 use crate::sparkplug::topic::ids::{DeviceId, EdgeNodeId, GroupId};
 use crate::sparkplug::types::{MessageType, MetricValue, Timestamp, WireOptions, wire_options};
@@ -29,36 +29,19 @@ impl SparkplugClient {
     /// a back-end service injects historical or synthetic metrics on behalf of
     /// multiple assets.
     ///
-    /// # Cancel safety
+    /// # Cancellation
     ///
-    /// This method is not cancel-safe. It counts the publish before it hands
-    /// the message to the client, and it holds that count across an `await`.
-    /// A cancelled call drops the count without a rollback. `unacked` then
-    /// stays one too high until the next disconnect, so every later
-    /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
+    /// This draws the `seq` of the edge node under that edge node's gate,
+    /// and holds the gate until the client takes the message. A cancelled
+    /// call drops the reservation, which writes the previous number back
+    /// under the gate, and releases the delivery count of a tracked
+    /// publish. So a cancelled publish leaves no gap for a host application
+    /// to read, and no count to hold a later [`Self::flush`] open.
     ///
-    /// It draws the `seq` of the edge node before the same `await`. A
-    /// cancelled call, and a message the client refuses, both leave that
-    /// number off the wire. The next message carries the number after it, so
-    /// a host application reads a gap and asks the edge node for a rebirth.
-    /// The counter does not roll back: another task can publish for the same
-    /// edge node while this call waits, so a rollback would give one number
-    /// to two messages. A host application recovers from a gap, because it
-    /// asks for a rebirth. It cannot recover from two messages that carry
-    /// one number.
-    ///
-    /// The same order applies to two tasks that publish for one edge node
-    /// on one client. This method draws the number, then
-    /// `AsyncClient::publish` waits for room in a bounded channel. The task
-    /// that drew 5 can wait while the task that drew 6 finds room, so 6
-    /// enters the channel first and the broker sends 6 before 5. A host
-    /// application reads that order as a gap and asks the edge node for a
-    /// rebirth. Publish for one edge node from one task to hold the order.
-    ///
-    /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
-    /// publish in a `select!` branch that another branch can cancel. Publish
-    /// the whole batch, then bound the wait with the `timeout` argument of
-    /// [`Self::flush`].
+    /// One window stays open. The client can take the message out of the
+    /// publish future in the same instant that the caller cancels the call.
+    /// That message reaches the broker, and the next message for the edge
+    /// node carries its number a second time.
     pub async fn publish_metric(
         &self,
         group_id: &str,
@@ -69,46 +52,19 @@ impl SparkplugClient {
         timestamp_ms: u64,
     ) -> Result<(), SparkplugError> {
         let metric = create_metric(metric_name, value, Timestamp(timestamp_ms));
-
         let topic = self.ddata_topic(group_id, node_id, device_id)?;
-        let payload = self.payload_for(&topic, vec![metric], Timestamp(timestamp_ms))?;
 
-        self.publish_message(&topic, payload.encode_to_vec()).await
+        self.publish_metrics_on(&topic, vec![metric], Timestamp(timestamp_ms))
+            .await
     }
 
     /// Publish a batch of metrics as one DDATA message for the edge node
     /// the caller names.
     ///
-    /// # Cancel safety
+    /// # Cancellation
     ///
-    /// This method is not cancel-safe. It counts the publish before it hands
-    /// the message to the client, and it holds that count across an `await`.
-    /// A cancelled call drops the count without a rollback. `unacked` then
-    /// stays one too high until the next disconnect, so every later
-    /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
-    ///
-    /// It draws the `seq` of the edge node before the same `await`. A
-    /// cancelled call, and a message the client refuses, both leave that
-    /// number off the wire. The next message carries the number after it, so
-    /// a host application reads a gap and asks the edge node for a rebirth.
-    /// The counter does not roll back: another task can publish for the same
-    /// edge node while this call waits, so a rollback would give one number
-    /// to two messages. A host application recovers from a gap, because it
-    /// asks for a rebirth. It cannot recover from two messages that carry
-    /// one number.
-    ///
-    /// The same order applies to two tasks that publish for one edge node
-    /// on one client. This method draws the number, then
-    /// `AsyncClient::publish` waits for room in a bounded channel. The task
-    /// that drew 5 can wait while the task that drew 6 finds room, so 6
-    /// enters the channel first and the broker sends 6 before 5. A host
-    /// application reads that order as a gap and asks the edge node for a
-    /// rebirth. Publish for one edge node from one task to hold the order.
-    ///
-    /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
-    /// publish in a `select!` branch that another branch can cancel. Publish
-    /// the whole batch, then bound the wait with the `timeout` argument of
-    /// [`Self::flush`].
+    /// A cancelled call restores the `seq` of its edge node and releases the
+    /// delivery count. See [`Self::publish_metric`].
     pub async fn publish_metrics(
         &self,
         group_id: &str,
@@ -117,9 +73,9 @@ impl SparkplugClient {
         metrics: Vec<(String, MetricValue, u64)>,
     ) -> Result<(), SparkplugError> {
         let topic = self.ddata_topic(group_id, node_id, device_id)?;
-        let payload = self.payload_for(&topic, proto_metrics(metrics), Timestamp::now())?;
 
-        self.publish_message(&topic, payload.encode_to_vec()).await
+        self.publish_metrics_on(&topic, proto_metrics(metrics), Timestamp::now())
+            .await
     }
 
     /// Publish NBIRTH + DBIRTH for a device of this client's edge node.
@@ -140,61 +96,40 @@ impl SparkplugClient {
     /// message, and [`SparkplugError::Encode`] when a payload will not
     /// encode.
     ///
-    /// # Cancel safety
+    /// # Cancellation
     ///
-    /// This method is not cancel-safe. It counts the publish before it hands
-    /// the message to the client, and it holds that count across an `await`.
-    /// A cancelled call drops the count without a rollback. `unacked` then
-    /// stays one too high until the next disconnect, so every later
-    /// [`Self::flush`] reports [`SparkplugError::FlushTimeout`].
-    ///
-    /// It draws the `seq` of the edge node before the same `await`. A
-    /// cancelled call, and a message the client refuses, both leave that
-    /// number off the wire. The next message carries the number after it, so
-    /// a host application reads a gap and asks the edge node for a rebirth.
-    /// The counter does not roll back: another task can publish for the same
-    /// edge node while this call waits, so a rollback would give one number
-    /// to two messages. A host application recovers from a gap, because it
-    /// asks for a rebirth. It cannot recover from two messages that carry
-    /// one number.
-    ///
-    /// The same order applies to two tasks that publish for one edge node
-    /// on one client. This method draws the number, then
-    /// `AsyncClient::publish` waits for room in a bounded channel. The task
-    /// that drew 5 can wait while the task that drew 6 finds room, so 6
-    /// enters the channel first and the broker sends 6 before 5. A host
-    /// application reads that order as a gap and asks the edge node for a
-    /// rebirth. Publish for one edge node from one task to hold the order.
-    ///
-    /// Do not wrap one publish in `tokio::time::timeout`. Do not put one
-    /// publish in a `select!` branch that another branch can cancel. Publish
-    /// the whole batch, then bound the wait with the `timeout` argument of
-    /// [`Self::flush`].
+    /// One reservation covers both births, so a cancelled call and a DBIRTH
+    /// the client refuses both leave the count where the NBIRTH found it.
+    /// See [`Self::publish_metric`].
     pub async fn publish_birth(&self, device: DeviceId<'_>) -> Result<(), SparkplugError> {
         let edge_node = self.edge_node().ok_or(SparkplugError::NotAnEdgeNode)?;
 
         // One birth event, so both payloads carry one instant.
         let at = Timestamp::now();
 
-        // Both births draw their count through `seq_for`, the one place
-        // that reads the counter. It reads the message type of the topic:
-        // an NBIRTH sets the count of its edge node back to 0, so the
-        // NBIRTH carries 0, and the DBIRTH beside it adds 1 and carries 1.
-        // The group and the edge node id together name the edge node that
-        // owns the count.
+        // One reservation covers both births. It reads the message type of
+        // the NBIRTH topic and sets the count of its edge node back to 0, so
+        // the NBIRTH carries 0 and the DBIRTH beside it carries 1. The
+        // reservation holds the gate of that edge node across both
+        // publishes, so no other publish for it takes a number between them.
         let nbirth_topic = self
             .namespace
             .nbirth(edge_node.group(), edge_node.edge_node_id());
-        let nbirth_payload = create_birth_certificate(at, self.seq_for(&nbirth_topic)?);
+        let mut seq = self.reserve_seq(&nbirth_topic).await?;
+
+        let nbirth_payload = create_birth_certificate(at, *seq);
         self.publish_message(&nbirth_topic, nbirth_payload.encode_to_vec())
             .await?;
 
         let dbirth_topic =
             self.namespace
                 .dbirth(edge_node.group(), edge_node.edge_node_id(), device);
-        let dbirth_payload = create_device_birth_certificate(at, self.seq_for(&dbirth_topic)?);
+        let dbirth_payload = create_device_birth_certificate(at, seq.next());
         self.publish_message(&dbirth_topic, dbirth_payload.encode_to_vec())
-            .await
+            .await?;
+
+        seq.commit();
+        Ok(())
     }
 
     /// Publish one metric to a topic the caller already built.
@@ -216,9 +151,9 @@ impl SparkplugClient {
     /// # }
     /// ```
     ///
-    /// # Cancel safety
+    /// # Cancellation
     ///
-    /// Not cancel-safe. See [`Self::publish_metric`].
+    /// A cancelled call moves no count. See [`Self::publish_metric`].
     ///
     /// # Errors
     ///
@@ -237,17 +172,17 @@ impl SparkplugClient {
     ) -> Result<(), SparkplugError> {
         let metric = create_metric(metric_name, value, Timestamp(timestamp_ms));
 
-        let payload = self.payload_for(topic, vec![metric], Timestamp(timestamp_ms))?;
-        self.publish_message(topic, payload.encode_to_vec()).await
+        self.publish_metrics_on(topic, vec![metric], Timestamp(timestamp_ms))
+            .await
     }
 
     /// Publish a batch of metrics to a topic the caller already built.
     ///
     /// The batch goes out as one message. See [`Self::publish_metric_to`].
     ///
-    /// # Cancel safety
+    /// # Cancellation
     ///
-    /// Not cancel-safe. See [`Self::publish_metric`].
+    /// A cancelled call moves no count. See [`Self::publish_metric`].
     ///
     /// # Errors
     ///
@@ -257,28 +192,37 @@ impl SparkplugClient {
         topic: &SparkplugTopic,
         metrics: Vec<(String, MetricValue, u64)>,
     ) -> Result<(), SparkplugError> {
-        let payload = self.payload_for(topic, proto_metrics(metrics), Timestamp::now())?;
-        self.publish_message(topic, payload.encode_to_vec()).await
+        self.publish_metrics_on(topic, proto_metrics(metrics), Timestamp::now())
+            .await
     }
 
-    /// Build a payload for `topic`, and draw the `seq` its edge node
-    /// gives the message.
+    /// Draw the `seq` of the edge node `topic` names, publish the metrics
+    /// under it, and keep the number only when the client takes the message.
     ///
-    /// Every publish that carries metrics passes through here.
+    /// Every publish that carries metrics passes through here. The
+    /// reservation holds the gate of that edge node from the draw until the
+    /// client answers, so the order the numbers are drawn in and the order
+    /// the messages reach the client agree.
     ///
     /// # Errors
     ///
-    /// See [`Self::seq_for`].
-    fn payload_for(
+    /// See [`Self::reserve_seq`].
+    async fn publish_metrics_on(
         &self,
         topic: &SparkplugTopic,
         metrics: Vec<Metric>,
         at: Timestamp,
-    ) -> Result<Payload, SparkplugError> {
-        Ok(create_payload(metrics, at, self.seq_for(topic)?))
+    ) -> Result<(), SparkplugError> {
+        let seq = self.reserve_seq(topic).await?;
+        let payload = create_payload(metrics, at, *seq);
+
+        self.publish_message(topic, payload.encode_to_vec()).await?;
+
+        seq.commit();
+        Ok(())
     }
 
-    /// Draw the `seq` that the next message on `topic` carries.
+    /// Reserve the `seq` that the next message on `topic` carries.
     ///
     /// One place reads the counter, so every publish path counts alike.
     /// The group and the edge node come from the topic, and that pair names
@@ -295,12 +239,15 @@ impl SparkplugClient {
     /// The topic hands back checked identifiers, so nothing here checks a
     /// segment again — see ADR-0002.
     ///
+    /// The reservation holds the gate of the edge node until it drops. The
+    /// caller must therefore publish and commit, or drop it — see ADR-0005.
+    ///
     /// # Errors
     ///
     /// Returns [`SparkplugError::InvalidTopic`] when the topic names no edge
     /// node. A host topic has that shape, and a STATE message carries no
     /// `seq`.
-    fn seq_for(&self, topic: &SparkplugTopic) -> Result<u8, SparkplugError> {
+    async fn reserve_seq(&self, topic: &SparkplugTopic) -> Result<SeqReservation, SparkplugError> {
         let (group, node) = topic.group_id().zip(topic.node_id()).ok_or_else(|| {
             SparkplugError::InvalidTopic(format!(
                 "{topic} names no edge node, so it holds no seq count"
@@ -308,8 +255,8 @@ impl SparkplugClient {
         })?;
 
         Ok(match topic.message_type() {
-            MessageType::NBIRTH => self.seq.reset(group, node),
-            _ => self.seq.next(group, node),
+            MessageType::NBIRTH => self.seq.reserve_reset(group, node).await,
+            _ => self.seq.reserve(group, node).await,
         })
     }
 
@@ -334,8 +281,8 @@ impl SparkplugClient {
     /// count the publish. An untracked message never reaches the tracker,
     /// which is what stops a QoS 0 publish from holding a later flush open.
     ///
-    /// A tracked publish is not cancel-safe. A cancelled call leaves
-    /// `unacked` one too high, so every later flush reports `FlushTimeout`.
+    /// A cancelled call releases whatever a tracked publish counted, so it
+    /// holds no later flush open.
     async fn publish_message(
         &self,
         topic: &SparkplugTopic,
@@ -398,8 +345,8 @@ pub(super) async fn publish_with_options(
     }
 }
 
-/// Count a publish, hand it to the client, then roll the count back when
-/// the client refuses it.
+/// Count a publish, hand it to the client, and release the count for any
+/// message that does not reach the client.
 ///
 /// The count must rise before `publish` runs. `publish_metric` and `flush`
 /// both take `&self`, so a task that shares this client can flush while a
@@ -407,9 +354,11 @@ pub(super) async fn publish_with_options(
 /// loss, and an early PubAck would leave a count that never clears.
 /// Over-counting only delays a flush, so it is the safe direction.
 ///
-/// The rollback carries the ticket from the matching `record_publish`, so a
-/// refusal can never cancel a count that a disconnect cleared or that
-/// belongs to a publish from another task.
+/// `PublishInFlight` holds the count. It releases the count when it drops,
+/// which covers the refusal below and the cancellation that drops this
+/// whole future. The guard carries the ticket of its own publish, so it can
+/// never release a count that a disconnect cleared or that belongs to a
+/// publish from another task.
 ///
 /// Split out as a free function so a test can drive the ordering without a
 /// broker.
@@ -417,12 +366,14 @@ pub(super) async fn record_around_publish(
     delivery: &DeliveryTracker,
     publish: impl Future<Output = Result<(), rumqttc::ClientError>>,
 ) -> Result<(), SparkplugError> {
-    let ticket = delivery.record_publish();
+    let in_flight = delivery.publish_in_flight();
+
     match publish.await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            delivery.record_publish_failed(ticket);
-            Err(SparkplugError::from(error))
+        Ok(()) => {
+            in_flight.keep();
+            Ok(())
         }
+        // `in_flight` drops here, which releases the count.
+        Err(error) => Err(SparkplugError::from(error)),
     }
 }

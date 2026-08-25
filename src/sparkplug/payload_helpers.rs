@@ -49,7 +49,8 @@ pub(super) fn create_payload(
 /// Create a node birth certificate payload (infallible).
 ///
 /// The payload and its one metric carry the same instant. The caller states
-/// `seq`, which an NBIRTH takes from [`super::seq::SeqCounters::reset`].
+/// `seq`, which an NBIRTH draws from
+/// [`super::seq::SeqCounters::reserve_reset`].
 #[must_use]
 pub(super) fn create_birth_certificate(timestamp: Timestamp, seq: u8) -> crate::payload::Payload {
     let metric = create_metric("Node Control/Rebirth", MetricValue::Float(0.0), timestamp);

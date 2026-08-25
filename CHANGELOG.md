@@ -7,7 +7,9 @@ A breaking release. `connect`, `connect_with_timeout`, `publish_metric`,
 signatures — but `MqttConfig` loses `node_id` and `group_id`,
 `publish_birth` takes one argument, `seq` counts for each edge node instead
 of holding a literal, and the payload builders, the datatype tables, the
-hand-rolled byte decoder and `pub mod util` leave the crate interface.
+hand-rolled byte decoder and `pub mod util` leave the crate interface. One
+behaviour changes without a signature: publishes for one edge node now run
+one at a time.
 
 ### Breaking changes
 
@@ -117,16 +119,47 @@ hand-rolled byte decoder and `pub mod util` leave the crate interface.
   that share one client keep separate counts. That one place reads the
   message type of the topic, so every publish path restarts the count at an
   NBIRTH — including a caller who builds an NBIRTH topic and sends it
-  through `publish_metric_to`. A publish the client refuses,
-  and a call the caller cancels, each leave one number off the wire, so a
-  host application reads a gap and asks for a rebirth. The counter does not
-  roll back, because a rollback races a publish from another task and would
-  give one number to two messages. Two tasks that publish for one edge node
-  on one client can still reach the broker in the other order, because the
-  client draws the number before it waits for room in a bounded channel — so
-  publish for one edge node from one task. This closes G5 of
+  through `publish_metric_to`. A publish draws its number under the gate of
+  its edge node and holds that gate until the message reaches the client, so
+  a refusal, a cancellation and two tasks that publish for one edge node all
+  leave the count right — see the entry below. This closes G5 of
   `docs/sparkplug-conformance-gaps.md`. `bdSeq`, the NDEATH Will and the
   rebirth after a reconnect stay open — see G1, G2 and G3.
+- A publish drew its `seq` and then awaited the client, and three losses
+  came from that order. A publish the client refused burned its number. A
+  cancelled call burned one the same way. Two tasks that published for one
+  edge node could reach the client in the other order, because the task that
+  drew 5 waited for room in a bounded channel while the task that drew 6
+  found room. A host application reads each of those as a gap and asks the
+  edge node for a rebirth. `SeqCounters` now holds one gate for each edge
+  node: a `tokio::sync::Mutex` around the count. `reserve` and
+  `reserve_reset` return a `SeqReservation`, which holds that gate and
+  derefs to the number the message carries. `commit` keeps the number,
+  because the client took the message. Every other end — a refusal, and the
+  cancellation that drops the publish future — drops the reservation, which
+  writes the previous number back under the gate. The rollback therefore
+  runs under the gate, which answers the one objection to a rollback: no
+  other publish for that edge node can read the number in between.
+  `publish_birth` holds one reservation across the NBIRTH and the DBIRTH, so
+  the pair carries 0 then 1 and a DBIRTH the client refuses leaves the count
+  where the NBIRTH found it. One window stays open: the client can take the
+  message out of the publish future in the same instant that the caller
+  cancels the call, and the next message for that edge node then carries its
+  number a second time. This is the first lock in the crate that a future
+  holds across an `await` — see ADR-0005.
+- A cancelled `Role::Publisher` publish stranded its `PublishTicket` in
+  `unacked`. The publish counted itself before it handed the message to the
+  client and held the bare ticket across that `await`, so cancellation
+  dropped the ticket with no rollback and the count stayed one too high
+  until the next disconnect. Every later `flush` reported
+  `SparkplugError::FlushTimeout`. `DeliveryTracker::publish_in_flight` now
+  returns a guard that carries the ticket and releases it through
+  `record_publish_failed` when it drops, so a cancelled publish releases its
+  count on the path a refused one already used. The guard carries the ticket
+  of its own publish, so it can still never release a count that a
+  disconnect cleared or that belongs to a publish from another task. A
+  `Role::EdgeNode` data publish is QoS 0 and untracked per ADR-0003, so it
+  holds no ticket and only its number goes back.
 - `publish_birth` read the clock twice, so an NBIRTH and the DBIRTH beside
   it could carry different milliseconds. One birth event now carries one
   instant, and each birth payload stamps its own metric to match.
@@ -155,6 +188,22 @@ hand-rolled byte decoder and `pub mod util` leave the crate interface.
 
 ### Changed
 
+- The publish methods are safe to cancel. 0.3.0 documented the opposite
+  contract: a cancelled publish left `unacked` one too high, and the 0.3.0
+  entry below tells a caller to apply the deadline around a whole batch
+  instead. The `seq` gate and the delivery guard under **Fixed** replace
+  that rule. A caller may now
+  wrap one publish in `tokio::time::timeout`, or put one publish in a
+  `select!` branch that another branch cancels. The `# Cancel safety` block
+  of each publish method is replaced by a `# Cancellation` block that states
+  the new contract and the one window ADR-0005 leaves open.
+- Publishes for one edge node run one at a time. A publish holds the gate of
+  its edge node from the draw until the client takes the message, so a
+  second publish for that edge node waits. Publishes for different edge
+  nodes take different gates and never wait for each other. The room in
+  `rumqttc`'s request channel bounds that wait, not the broker, because
+  `AsyncClient::publish` resolves when the request enters that channel. This
+  is the cost of the gate that the `seq` fix installs.
 - `MessageType::spec_qos` and `MessageType::spec_retain` now have a caller
   inside the crate. They stated the specification's rules while the publish
   path hardcoded QoS 1 and retain false, so the rules were tested and the

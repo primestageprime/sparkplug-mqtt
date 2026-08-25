@@ -143,12 +143,16 @@ match client.flush(Duration::from_secs(5)).await {
 }
 ```
 
-The publish methods are not cancel-safe. A cancelled publish leaves `unacked`
-one too high, so every later `flush` reports `SparkplugError::FlushTimeout`.
-Only a disconnect clears that count. Do not wrap one publish in
-`tokio::time::timeout`. Do not put one publish in a `select!` branch that
-another branch can cancel. Apply the deadline around the whole batch, and use
-the `timeout` argument of `flush`.
+A cancelled publish moves no count. Each publish holds the `seq` gate of its
+edge node from the moment it draws the number until the client takes the
+message, so a cancelled call writes the number back and releases the delivery
+count it took. You may therefore wrap one publish in `tokio::time::timeout`,
+or put one in a `select!` branch that another branch cancels.
+
+One window stays open. The client can take the message out of the publish
+future in the same instant that the caller cancels the call. That message
+reaches the broker, and the next message for that edge node carries its
+number a second time. See ADR-0005.
 
 Call `client.shutdown(Duration::from_secs(5))` before a short-lived process
 exits. `shutdown` flushes, sends a DISCONNECT, and then stops the event loop.

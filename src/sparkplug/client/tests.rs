@@ -19,6 +19,10 @@ mod seq;
 /// the same reason.
 mod metrics;
 
+/// What the gate of an edge node guarantees when a publish stalls. Its own
+/// file, for the same reason.
+mod gate;
+
 #[tokio::test]
 async fn a_publish_is_counted_before_the_client_sees_it() {
     let delivery = DeliveryTracker::new();
@@ -213,6 +217,9 @@ fn a_bad_namespace_fails_the_connect_rather_than_every_publish() {
 
 /// Build a client whose publishes land in a channel instead of a socket.
 ///
+/// `capacity` is how many requests that channel holds. A test that needs a
+/// publish to stall names a small capacity and fills the channel first.
+///
 /// The event loop task parks forever. `Drop` aborts it, so nothing leaks.
 ///
 /// This builds the struct field by field, which is the widest route into a
@@ -220,8 +227,11 @@ fn a_bad_namespace_fails_the_connect_rather_than_every_publish() {
 /// variant holds `OwnedEdgeNode`, so this route reaches the edge node role
 /// only with a checked edge node beside it — a constructor alone could not
 /// state that.
-fn wired(identity: Identity) -> (SparkplugClient, flume::Receiver<rumqttc::Request>) {
-    let (tx, rx) = flume::bounded(16);
+fn wired(
+    identity: Identity,
+    capacity: usize,
+) -> (SparkplugClient, flume::Receiver<rumqttc::Request>) {
+    let (tx, rx) = flume::bounded(capacity);
     let (health, _) = tokio::sync::watch::channel(Health::Disconnected);
 
     let client = SparkplugClient {
@@ -239,7 +249,7 @@ fn wired(identity: Identity) -> (SparkplugClient, flume::Receiver<rumqttc::Reque
 
 /// Build a wired client that borrows the edge node of every publish.
 fn wired_publisher() -> (SparkplugClient, flume::Receiver<rumqttc::Request>) {
-    wired(Identity::Publisher)
+    wired(Identity::Publisher, 16)
 }
 
 /// Name one edge node from two literals, checking both segments.
@@ -263,7 +273,7 @@ fn edge_node_named<'a>(group: &'a str, edge_node_id: &'a str) -> EdgeNode<'a> {
 fn wired_edge_node(
     edge_node: EdgeNode<'_>,
 ) -> (SparkplugClient, flume::Receiver<rumqttc::Request>) {
-    wired(Identity::EdgeNode(edge_node.into()))
+    wired(Identity::EdgeNode(edge_node.into()), 16)
 }
 
 fn ddata_topic(client: &SparkplugClient) -> SparkplugTopic {

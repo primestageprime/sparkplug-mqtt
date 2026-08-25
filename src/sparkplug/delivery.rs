@@ -38,10 +38,12 @@ struct State {
 /// [`DeliveryTracker::record_publish_failed`] consumes it. The type is
 /// neither `Copy` nor `Clone`, so one publish can roll back at most once.
 ///
-/// A future that holds a ticket across an `await` is not cancel-safe.
+/// A bare ticket that a future holds across an `await` is not cancel-safe.
 /// Cancellation drops the ticket without a rollback. `unacked` then stays
 /// one too high, so every later [`DeliveryTracker::flush`] reports
-/// [`SparkplugError::FlushTimeout`] until the next disconnect.
+/// [`SparkplugError::FlushTimeout`] until the next disconnect. The publish
+/// path of this crate holds the ticket in a guard instead, and that guard
+/// rolls the count back when a cancelled publish drops it.
 #[derive(Debug)]
 #[must_use = "a ticket must reach `record_publish_failed`, or the caller must release it on purpose"]
 pub struct PublishTicket {
@@ -88,6 +90,19 @@ impl DeliveryTracker {
         state.unacked += 1;
         PublishTicket {
             generation: state.generation,
+        }
+    }
+
+    /// Count one QoS 1 publish and hold its rollback in a guard.
+    ///
+    /// Prefer this to [`Self::record_publish`] wherever the publish crosses
+    /// an `await`. The guard rolls the count back when it drops, so a
+    /// cancelled publish releases its count the same way a refused one does.
+    /// Call [`PublishInFlight::keep`] once the client takes the message.
+    pub(crate) fn publish_in_flight(&self) -> PublishInFlight<'_> {
+        PublishInFlight {
+            delivery: self,
+            ticket: Some(self.record_publish()),
         }
     }
 
@@ -199,6 +214,47 @@ impl DeliveryTracker {
     }
 }
 
+/// One counted publish that the tracker releases unless the caller keeps
+/// it.
+///
+/// [`DeliveryTracker::publish_in_flight`] counts the publish and returns
+/// this guard. [`Self::keep`] leaves the count outstanding, because the
+/// client took the message and the broker will answer it. Every other end —
+/// a refusal, and the cancellation that drops the publish future — drops
+/// the guard, which releases the count through
+/// [`DeliveryTracker::record_publish_failed`]. So a message that never left
+/// holds no later [`DeliveryTracker::flush`] open.
+///
+/// The guard carries the ticket, so it obeys the generation rule that
+/// [`DeliveryTracker::record_publish_failed`] states: a disconnect between
+/// the two calls already cleared the count, and this releases nothing.
+#[derive(Debug)]
+#[must_use = "the guard releases the count when it drops, so hold it across the publish"]
+pub(crate) struct PublishInFlight<'a> {
+    delivery: &'a DeliveryTracker,
+    /// The ticket of this publish, until one of the two ends takes it.
+    ticket: Option<PublishTicket>,
+}
+
+impl PublishInFlight<'_> {
+    /// Leave the count outstanding, because the client took the message.
+    ///
+    /// The broker answers a QoS 1 publish with a PubAck, and
+    /// [`DeliveryTracker::record_ack`] clears the count then.
+    pub(crate) fn keep(mut self) {
+        // Release the ticket without a rollback. The count stays.
+        self.ticket = None;
+    }
+}
+
+impl Drop for PublishInFlight<'_> {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            self.delivery.record_publish_failed(ticket);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +331,24 @@ mod tests {
             tracker.unacked(),
             0,
             "a message the client refused must not hold a flush open"
+        );
+    }
+
+    #[test]
+    fn a_dropped_guard_releases_the_count_and_a_kept_one_does_not() {
+        let tracker = DeliveryTracker::new();
+        drop(tracker.publish_in_flight());
+        assert_eq!(
+            tracker.unacked(),
+            0,
+            "a cancelled publish must not hold a flush open"
+        );
+
+        tracker.publish_in_flight().keep();
+        assert_eq!(
+            tracker.unacked(),
+            1,
+            "a publish the client took stays outstanding until the broker answers"
         );
     }
 
