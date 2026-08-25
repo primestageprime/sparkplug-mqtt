@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
+
+A breaking release. `connect`, `connect_with_timeout`, `publish_metric`,
+`publish_metrics`, `publish_metric_to` and `publish_metrics_to` keep their
+signatures — but `MqttConfig` loses `node_id` and `group_id`,
+`publish_birth` takes one argument, `seq` counts for each edge node instead
+of holding a literal, and the payload builders, the datatype tables, the
+hand-rolled byte decoder and `pub mod util` leave the crate interface.
 
 ### Breaking changes
 
@@ -24,8 +31,9 @@
   disconnects the earlier session, which the event loop then reconnects.
   `mqtt_options` calls this only when `client_id` is `None`.
 - `SparkplugClient::connect_as(config, role, timeout)` is removed. It is
-  unreleased — the entry below adds it — and it could reach `Role::EdgeNode`
-  with no edge node beside it, which is the state ADR-0004 removes.
+  unreleased — it was added and removed inside this cycle, so no entry below
+  adds it — and it could reach `Role::EdgeNode` with no edge node beside it,
+  which is the state ADR-0004 removes.
   `connect_as_edge_node(config, edge_node, timeout)` replaces it and takes
   the identity the role needs. `connect` and `connect_with_timeout` keep
   their signatures and their behaviour.

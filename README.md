@@ -6,7 +6,7 @@ SparkPlug B protocol client for MQTT — connect, publish, and subscribe to indu
 
 ```toml
 [dependencies]
-sparkplug-mqtt = "0.4"
+sparkplug-mqtt = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 ```
 
