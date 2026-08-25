@@ -15,6 +15,10 @@ use crate::sparkplug::types::{MessageType, MetricValue, wire_options};
 /// module size limit.
 mod seq;
 
+/// What metric each publish path reaches the wire with. Its own file, for
+/// the same reason.
+mod metrics;
+
 #[tokio::test]
 async fn a_publish_is_counted_before_the_client_sees_it() {
     let delivery = DeliveryTracker::new();

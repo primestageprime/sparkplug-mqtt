@@ -13,7 +13,7 @@ use crate::payload::payload::Metric;
 use super::SparkplugClient;
 use crate::sparkplug::delivery::DeliveryTracker;
 use crate::sparkplug::payload_helpers::{
-    create_birth_certificate, create_device_birth_certificate, create_payload,
+    create_birth_certificate, create_device_birth_certificate, create_metric, create_payload,
 };
 use crate::sparkplug::topic::SparkplugTopic;
 use crate::sparkplug::topic::ids::{DeviceId, EdgeNodeId, GroupId};
@@ -68,14 +68,7 @@ impl SparkplugClient {
         value: MetricValue,
         timestamp_ms: u64,
     ) -> Result<(), SparkplugError> {
-        let (proto_value, datatype) = value.to_proto();
-        let metric = Metric {
-            name: Some(metric_name.to_string()),
-            value: Some(proto_value),
-            datatype: Some(datatype.code()),
-            timestamp: Some(timestamp_ms),
-            ..Default::default()
-        };
+        let metric = create_metric(metric_name, value, Timestamp(timestamp_ms));
 
         let topic = self.ddata_topic(group_id, node_id, device_id)?;
         let payload = self.payload_for(&topic, vec![metric], Timestamp(timestamp_ms))?;
@@ -242,14 +235,7 @@ impl SparkplugClient {
         value: MetricValue,
         timestamp_ms: u64,
     ) -> Result<(), SparkplugError> {
-        let (proto_value, datatype) = value.to_proto();
-        let metric = Metric {
-            name: Some(metric_name.to_string()),
-            value: Some(proto_value),
-            datatype: Some(datatype.code()),
-            timestamp: Some(timestamp_ms),
-            ..Default::default()
-        };
+        let metric = create_metric(metric_name, value, Timestamp(timestamp_ms));
 
         let payload = self.payload_for(topic, vec![metric], Timestamp(timestamp_ms))?;
         self.publish_message(topic, payload.encode_to_vec()).await
@@ -386,19 +372,13 @@ impl SparkplugClient {
 }
 
 /// Map caller metrics onto their protobuf form.
+///
+/// Each metric carries the instant the caller gives beside it, so a batch
+/// can hold values read at different times.
 pub(super) fn proto_metrics(metrics: Vec<(String, MetricValue, u64)>) -> Vec<Metric> {
     metrics
         .into_iter()
-        .map(|(name, value, ts)| {
-            let (proto_value, datatype) = value.to_proto();
-            Metric {
-                name: Some(name),
-                value: Some(proto_value),
-                datatype: Some(datatype.code()),
-                timestamp: Some(ts),
-                ..Default::default()
-            }
-        })
+        .map(|(name, value, ts)| create_metric(name, value, Timestamp(ts)))
         .collect()
 }
 

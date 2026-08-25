@@ -6,8 +6,15 @@ use super::types::{MetricValue, Timestamp};
 ///
 /// The caller states the instant. This builder reads no clock, so a test can
 /// pin what it expects.
+///
+/// Every publish path builds its metrics here, so one place reads
+/// [`MetricValue::to_proto`] and writes the datatype beside the value.
 #[must_use]
-fn create_metric(name: impl Into<String>, value: MetricValue, timestamp: Timestamp) -> Metric {
+pub(super) fn create_metric(
+    name: impl Into<String>,
+    value: MetricValue,
+    timestamp: Timestamp,
+) -> Metric {
     let (proto_value, datatype) = value.to_proto();
     Metric {
         name: Some(name.into()),
