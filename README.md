@@ -11,27 +11,37 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 ```
 
 ```rust
-use sparkplug_mqtt::{MqttConfig, SparkplugClient, MetricValue};
+use sparkplug_mqtt::{
+    DEFAULT_CONNECT_TIMEOUT, DeviceId, EdgeNode, EdgeNodeId, GroupId, MetricValue, MqttConfig,
+    SparkplugClient,
+};
 use rumqttc::Transport;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), sparkplug_mqtt::SparkplugError> {
+    // The config names the MQTT connection. `client_id: None` takes a
+    // generated one; name it yourself when one process opens several
+    // connections.
     let config = MqttConfig {
         broker_url: "localhost".to_owned(),
         broker_port: 1883,
         transport: Transport::Tcp,
         username: String::new(),
         password: String::new(),
-        group_id: "Plant1".to_owned(),
-        node_id: "edge1".to_owned(),
+        client_id: None,
         version: "spBv1.0".to_owned(),
     };
 
-    // Waits up to 5 s for ConnAck; returns Err on timeout.
-    let client = SparkplugClient::connect(&config).await?;
+    // This pair names the edge node the client speaks for. It is fixed for
+    // the session, and every birth below announces it.
+    let edge_node = EdgeNode::new(GroupId::new("Plant1")?, EdgeNodeId::new("edge1")?);
 
-    client.publish_birth("Plant1", "pump1").await?;
+    // Waits up to 5 s for ConnAck; returns Err on timeout.
+    let client =
+        SparkplugClient::connect_as_edge_node(&config, edge_node, DEFAULT_CONNECT_TIMEOUT).await?;
+
+    client.publish_birth(DeviceId::new("pump1")?).await?;
 
     loop {
         client.publish_metric(
@@ -59,12 +69,36 @@ async fn main() -> Result<(), sparkplug_mqtt::SparkplugError> {
   with the wrong shape for its message type is reported, not reinterpreted
 - **Identifiers that cannot be swapped** — `GroupId`, `EdgeNodeId` and `DeviceId` are
   checked once and are not interchangeable, so a transposed argument stops compiling
+- **A client id is not an edge node** — `MqttConfig` names the connection alone.
+  A client that speaks for one edge node takes that identity at connect, as an
+  `EdgeNode` pair, so its births and its data can never name two different
+  edge nodes
 - **Multiple metric types** — Float (f64), String, Bool, Int (u64)
 - **Delivery you can confirm** — `flush` waits for the broker and reports what a
   reconnect discarded, instead of reporting an enqueued message as delivered
 - **TLS support** — `tls_transport()` loads system root certificates
 - **Robust event loop** — automatic reconnection with backoff on errors
 - **Async/await** — built on tokio and rumqttc
+
+## Two roles: publisher and edge node
+
+`SparkplugClient::connect` gives a **publisher client**. It takes the edge node
+of each publish per call, so one connection can publish for many edge nodes. It
+publishes at QoS 1, which the broker acknowledges, so `flush` reports what a
+reconnect discarded. It owns no edge node, so `publish_birth` reports
+`SparkplugError::NotAnEdgeNode`.
+
+`SparkplugClient::connect_as_edge_node` gives an **edge node client**. It names
+one edge node at connect and speaks for it alone. `publish_birth` announces
+that edge node, so the births and the data of that edge node share one `seq`
+count. It publishes at the QoS the specification fixes, which is QoS 0 for
+every message this crate sends today — the broker acknowledges none of it, so
+`flush` confirms nothing. Read `tracks_delivery()` once at startup before you
+gate a durable write on `flush`.
+
+The client id is separate from both. It names one MQTT connection, it reaches
+no topic segment, and a process that opens several connections must give each
+one its own — a broker reads two connections with one client id as a takeover.
 
 ## Publishing without transposing an identifier
 
@@ -137,7 +171,8 @@ DISCONNECT request, which names the cause instead of the deadline.
 ## Known Limitations
 
 - **A publish is not a delivery.** `publish_metric` and `publish_metrics` put the message in an internal queue and return `Ok(())`, even when the connection is down. Call `flush(timeout)` to wait until the broker acknowledges every message. Call `shutdown(timeout)` to drain the queue before a short-lived process exits. Sparkplug needs `clean_session = true`, so a disconnect discards the queued messages. `flush` reports that loss as `SparkplugError::PublishLost` instead of hiding it. Use `health()` to watch the link state.
-- **A client is not yet a conformant edge node.** `seq` counts the messages of each edge node the client publishes for: an NBIRTH sets that count to 0, every message after it adds 1, and the count wraps from 255 back to 0. The pair `group_id/edge_node_id` names the edge node that owns the count. `bdSeq`, the NDEATH registration at connect time, and the rebirth after a reconnect are not implemented, so the session lifecycle still misses parts the specification requires.
+- **A client is not yet a conformant edge node.** `seq` counts the messages of each edge node the client publishes for: an NBIRTH sets that count to 0, every message after it adds 1, and the count wraps from 255 back to 0. The pair `group_id/edge_node_id` names the edge node that owns the count, and an edge node client fixes that pair at connect. `bdSeq`, the NDEATH registration at connect time, and the rebirth after a reconnect are not implemented, so the session lifecycle still misses parts the specification requires.
+- **A publisher client learns about `publish_birth` at runtime.** One type serves both roles, so the compiler cannot refuse the call. It returns `SparkplugError::NotAnEdgeNode`. Splitting the client type would refuse it at compile time — see ADR-0003 and ADR-0004.
 
 ## License
 

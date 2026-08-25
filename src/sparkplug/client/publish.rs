@@ -20,6 +20,8 @@ use crate::sparkplug::topic::ids::{DeviceId, EdgeNodeId, GroupId};
 use crate::sparkplug::types::{MessageType, MetricValue, Timestamp, WireOptions, wire_options};
 
 impl SparkplugClient {
+    /// Publish a single metric as a DDATA message for the edge node the
+    /// caller names.
     ///
     /// The Sparkplug topic is `{version}/{group_id}/DDATA/{node_id}/{device_id}`,
     /// so the caller controls the edge-node identity per publish. A single
@@ -81,7 +83,8 @@ impl SparkplugClient {
         self.publish_message(&topic, payload.encode_to_vec()).await
     }
 
-    /// Publish a batch of metrics as a single DDATA message on behalf of `node_id`.
+    /// Publish a batch of metrics as one DDATA message for the edge node
+    /// the caller names.
     ///
     /// # Cancel safety
     ///
@@ -126,7 +129,23 @@ impl SparkplugClient {
         self.publish_message(&topic, payload.encode_to_vec()).await
     }
 
-    /// Publish NBIRTH + DBIRTH for a device.
+    /// Publish NBIRTH + DBIRTH for a device of this client's edge node.
+    ///
+    /// The group and the edge node come from the identity this client took
+    /// at connect, and nothing can change them afterwards. So the births and
+    /// the data of that edge node name one edge node and share one `seq`
+    /// count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SparkplugError::NotAnEdgeNode`] when this client connected
+    /// as a publisher. Such a client owns no edge node, so it has none to
+    /// announce — connect through
+    /// [`SparkplugClient::connect_as_edge_node`] instead.
+    ///
+    /// Returns [`SparkplugError::Publish`] when the client refuses a
+    /// message, and [`SparkplugError::Encode`] when a payload will not
+    /// encode.
     ///
     /// # Cancel safety
     ///
@@ -158,34 +177,28 @@ impl SparkplugClient {
     /// publish in a `select!` branch that another branch can cancel. Publish
     /// the whole batch, then bound the wait with the `timeout` argument of
     /// [`Self::flush`].
-    pub async fn publish_birth(
-        &self,
-        group_id: &str,
-        device_id: &str,
-    ) -> Result<(), SparkplugError> {
-        // Both births name this client's own edge node, while
-        // `publish_metric` takes the edge node per call. Where they differ,
-        // births and data land on different edge nodes.
-        //
+    pub async fn publish_birth(&self, device: DeviceId<'_>) -> Result<(), SparkplugError> {
+        let edge_node = self.edge_node().ok_or(SparkplugError::NotAnEdgeNode)?;
+
         // One birth event, so both payloads carry one instant.
         let at = Timestamp::now();
-        let group = GroupId::new(group_id)?;
-        let node = EdgeNodeId::new(&self.node_id)?;
 
         // Both births draw their count through `seq_for`, the one place
         // that reads the counter. It reads the message type of the topic:
         // an NBIRTH sets the count of its edge node back to 0, so the
         // NBIRTH carries 0, and the DBIRTH beside it adds 1 and carries 1.
-        // The group and the node id together name the edge node that owns
-        // the count.
-        let nbirth_topic = self.namespace.nbirth(group, node);
+        // The group and the edge node id together name the edge node that
+        // owns the count.
+        let nbirth_topic = self
+            .namespace
+            .nbirth(edge_node.group(), edge_node.edge_node_id());
         let nbirth_payload = create_birth_certificate(at, self.seq_for(&nbirth_topic)?);
         self.publish_message(&nbirth_topic, nbirth_payload.encode_to_vec())
             .await?;
 
-        let dbirth_topic = self
-            .namespace
-            .dbirth(group, node, DeviceId::new(device_id)?);
+        let dbirth_topic =
+            self.namespace
+                .dbirth(edge_node.group(), edge_node.edge_node_id(), device);
         let dbirth_payload = create_device_birth_certificate(at, self.seq_for(&dbirth_topic)?);
         self.publish_message(&dbirth_topic, dbirth_payload.encode_to_vec())
             .await
@@ -342,7 +355,7 @@ impl SparkplugClient {
         topic: &SparkplugTopic,
         payload: Vec<u8>,
     ) -> Result<(), SparkplugError> {
-        let options = wire_options(self.role, topic.message_type());
+        let options = wire_options(self.role(), topic.message_type());
 
         publish_with_options(
             &self.delivery,
@@ -368,7 +381,7 @@ impl SparkplugClient {
     /// wants is not available in this role, not that a publish failed.
     #[must_use]
     pub fn tracks_delivery(&self) -> bool {
-        wire_options(self.role, MessageType::DDATA).tracked
+        wire_options(self.role(), MessageType::DDATA).tracked
     }
 }
 

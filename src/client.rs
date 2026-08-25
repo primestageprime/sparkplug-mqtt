@@ -45,6 +45,12 @@ pub fn tls_transport() -> Result<Transport, SparkplugError> {
     ))))
 }
 
+/// What one MQTT connection needs.
+///
+/// This names the connection alone. It carries no Sparkplug identity: a
+/// client takes the edge node it speaks for at connect, through
+/// [`crate::SparkplugClient::connect_as_edge_node`], and a publisher client
+/// takes the edge node of each publish per call.
 #[derive(Clone)]
 pub struct MqttConfig {
     pub broker_url: String,
@@ -52,8 +58,12 @@ pub struct MqttConfig {
     pub transport: Transport,
     pub username: String,
     pub password: String,
-    pub group_id: String, // names the client id only; every publish takes its own
-    pub node_id: String,
+    /// The MQTT-level identifier of this connection.
+    ///
+    /// A broker treats two connections that share a client id as a
+    /// takeover, so give each connection of one process its own value. Leave
+    /// this `None` to take a generated one — see [`generate_client_id`].
+    pub client_id: Option<String>,
     pub version: String,
 }
 
@@ -64,26 +74,26 @@ impl std::fmt::Debug for MqttConfig {
             .field("broker_port", &self.broker_port)
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
-            .field("group_id", &self.group_id)
-            .field("node_id", &self.node_id)
+            .field("client_id", &self.client_id)
             .field("version", &self.version)
             .finish_non_exhaustive()
     }
 }
 
-/// Generate a client ID in the format `{version}_{group}_{node}_{random 1000–9999}`.
+/// Generate a client id in the format `{version}_{random 32-bit hex}`.
 ///
-/// The random suffix keeps two connections from one process off the same
-/// client id, which a broker would treat as a takeover.
+/// [`mqtt_options`] calls this when [`MqttConfig::client_id`] is `None`. A
+/// broker treats two connections that share a client id as a takeover, and
+/// it disconnects the earlier session, which the event loop then reconnects.
+/// The suffix draws one of 2^32 values to keep the connections of one
+/// process apart. `version` is the same string for every caller, so the
+/// suffix carries all of the difference. Set
+/// [`MqttConfig::client_id`] to name a connection yourself.
+///
+/// A client id names an MQTT connection only. It names no edge node.
 #[must_use]
-pub fn generate_client_id(config: &MqttConfig) -> String {
-    format!(
-        "{}_{}_{}_{}",
-        config.version,
-        config.group_id,
-        config.node_id,
-        rand::random::<u16>() % 9000 + 1000
-    )
+pub fn generate_client_id(version: &str) -> String {
+    format!("{version}_{:08x}", rand::random::<u32>())
 }
 
 /// Build the MQTT options a Sparkplug connection needs.
@@ -96,7 +106,10 @@ pub fn generate_client_id(config: &MqttConfig) -> String {
 /// without opening a socket.
 #[must_use]
 pub fn mqtt_options(config: &MqttConfig) -> MqttOptions {
-    let client_id = generate_client_id(config);
+    let client_id = config
+        .client_id
+        .clone()
+        .unwrap_or_else(|| generate_client_id(&config.version));
     let mut options = MqttOptions::new(client_id, &config.broker_url, config.broker_port);
 
     options.set_credentials(&config.username, &config.password);
@@ -135,8 +148,7 @@ mod tests {
             transport: Transport::Tcp,
             username: String::new(),
             password: String::new(),
-            group_id: "MyGroup".to_owned(),
-            node_id: "node1".to_owned(),
+            client_id: None,
             version: "spBv1.0".to_owned(),
         }
     }
@@ -150,14 +162,17 @@ mod tests {
 
     #[test]
     fn client_id_format() {
-        let id = generate_client_id(&config());
-        assert!(id.starts_with("spBv1.0_MyGroup_node1_"));
+        let id = generate_client_id("spBv1.0");
+        assert!(id.starts_with("spBv1.0_"));
         let suffix: &str = id
             .rsplit('_')
             .next()
             .expect("client ID should contain underscores");
-        let num: u16 = suffix.parse().expect("suffix should be a number");
-        assert!((1000..=9999).contains(&num));
+        assert_eq!(suffix.len(), 8, "the suffix holds a 32-bit value in hex");
+        assert!(
+            u32::from_str_radix(suffix, 16).is_ok(),
+            "the suffix must read as hex, got {suffix:?}"
+        );
     }
 
     #[test]
@@ -193,6 +208,20 @@ mod tests {
     #[test]
     fn the_options_carry_the_generated_client_id() {
         let options = mqtt_options(&config());
-        assert!(options.client_id().starts_with("spBv1.0_MyGroup_node1_"));
+        assert!(options.client_id().starts_with("spBv1.0_"));
+    }
+
+    #[test]
+    fn the_options_carry_the_client_id_the_caller_gives() {
+        let config = MqttConfig {
+            client_id: Some("stax-publisher-7".to_owned()),
+            ..config()
+        };
+        assert_eq!(
+            mqtt_options(&config).client_id(),
+            "stax-publisher-7",
+            "a caller that names its connection must reach the broker under \
+             that name"
+        );
     }
 }

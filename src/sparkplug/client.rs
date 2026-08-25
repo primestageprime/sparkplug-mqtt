@@ -8,11 +8,34 @@ use super::delivery::DeliveryTracker;
 use super::eventloop::Health;
 use super::seq::SeqCounters;
 use super::topic::Namespace;
+use super::topic::ids::{EdgeNode, OwnedEdgeNode};
 use super::types::Role;
 
 mod publish;
 mod shutdown;
 use shutdown::{disconnect_outcome, shutdown_outcome};
+
+/// Which Sparkplug identity a client holds, fixed when it connects.
+///
+/// The identity and the role are one value, so a client in the edge node
+/// role always names the edge node it speaks for. Nothing can build the
+/// role without a checked pair beside it — see ADR-0004.
+enum Identity {
+    /// Publishes on behalf of edge nodes it does not own.
+    ///
+    /// It names no edge node of its own, so it announces no birth and no
+    /// death. Every publish carries the edge node the caller gives it.
+    Publisher,
+
+    /// Speaks for one edge node, named here at connect.
+    ///
+    /// [`OwnedEdgeNode`] holds the group and the edge node id together, as
+    /// Sparkplug requires. Its fields are private and its only constructor
+    /// takes an [`EdgeNode`], so this variant cannot hold a segment that no
+    /// check passed. [`SparkplugClient::edge_node`] borrows the pair back
+    /// without a second check.
+    EdgeNode(OwnedEdgeNode),
+}
 
 /// A self-contained SparkPlug B client that owns an `AsyncClient` and a
 /// background event loop.
@@ -30,13 +53,11 @@ use shutdown::{disconnect_outcome, shutdown_outcome};
 ///     transport: Transport::Tcp,
 ///     username: "user".to_owned(),
 ///     password: "pass".to_owned(),
-///     group_id: "MyGroup".to_owned(),
-///     node_id: "node1".to_owned(),
+///     client_id: None,
 ///     version: "spBv1.0".to_owned(),
 /// };
 ///
 /// let client = SparkplugClient::connect(&config).await?;
-/// client.publish_birth("MyGroup", "device1").await?;
 /// client
 ///     .publish_metric("MyGroup", "node1", "device1", "temperature", MetricValue::Float(23.5), 0)
 ///     .await?;
@@ -44,18 +65,20 @@ use shutdown::{disconnect_outcome, shutdown_outcome};
 /// # }
 /// ```
 ///
-/// The `node_id` parameter on `publish_metric`/`publish_metrics` is explicit
-/// so a single client can publish on behalf of multiple Sparkplug edge nodes
-/// (e.g. one connection, many assets).
+/// [`Self::connect`] gives a publisher client, which takes the edge node of
+/// each publish per call — one connection can publish for many edge nodes.
+/// Call [`Self::connect_as_edge_node`] to speak for one edge node named at
+/// connect, which is the client [`Self::publish_birth`] needs.
 pub struct SparkplugClient {
     client: rumqttc::AsyncClient,
     namespace: Namespace,
-    node_id: Arc<str>,
+    /// Which Sparkplug identity this client holds. It decides the role, so
+    /// the two cannot disagree.
+    identity: Identity,
     delivery: Arc<DeliveryTracker>,
     /// The `seq` count of each edge node this client publishes for.
     seq: Arc<SeqCounters>,
     health: tokio::sync::watch::Sender<Health>,
-    role: Role,
     event_loop_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -66,20 +89,25 @@ impl Drop for SparkplugClient {
 }
 
 impl SparkplugClient {
-    /// Connect to an MQTT broker and return a ready-to-use client.
+    /// Connect to an MQTT broker and return a ready-to-use publisher client.
     ///
     /// Waits up to 5 seconds for the initial connection. The background
     /// event loop reconnects automatically if the connection drops later.
+    ///
+    /// The client takes the edge node of each publish per call and owns
+    /// none, so it announces no birth. Call [`Self::connect_as_edge_node`]
+    /// for a client that speaks for one edge node.
     ///
     /// # Errors
     ///
     /// Returns [`SparkplugError::ConnectionTimeout`] if the broker doesn't
     /// respond within 5 seconds.
     pub async fn connect(config: &MqttConfig) -> Result<Self, SparkplugError> {
-        Self::connect_as(config, Role::Publisher, DEFAULT_CONNECT_TIMEOUT).await
+        Self::connect_with(config, Identity::Publisher, DEFAULT_CONNECT_TIMEOUT).await
     }
 
-    /// Connect, waiting up to `timeout` for the broker to answer.
+    /// Connect as a publisher, waiting up to `timeout` for the broker to
+    /// answer.
     ///
     /// [`Self::connect`] uses five seconds. Raise it when the broker may be
     /// restarting alongside this process.
@@ -94,19 +122,22 @@ impl SparkplugClient {
         config: &MqttConfig,
         timeout: Duration,
     ) -> Result<Self, SparkplugError> {
-        Self::connect_as(config, Role::Publisher, timeout).await
+        Self::connect_with(config, Identity::Publisher, timeout).await
     }
 
-    /// Connect in a chosen role, waiting up to `timeout` for the broker.
+    /// Connect as one edge node, named here and fixed for the session.
     ///
-    /// The role fixes the QoS and the retain flag every publish uses, and
-    /// with them whether [`Self::flush`] can confirm anything. Read
-    /// [`Role`] before choosing, and [`Self::tracks_delivery`] after.
+    /// `edge_node` names the Sparkplug entity this client speaks for.
+    /// `config.client_id` names the MQTT connection. The two are separate:
+    /// one process can hold several connections, each with its own client
+    /// id, and only some of them speak for an edge node.
     ///
-    /// [`Self::connect`] and [`Self::connect_with_timeout`] both call this
-    /// with [`Role::Publisher`], which is why raising the crate version
-    /// changes no existing caller's behaviour. Pass
-    /// [`DEFAULT_CONNECT_TIMEOUT`] for the timeout those two use.
+    /// The client publishes in [`Role::EdgeNode`], which takes the QoS and
+    /// the retain flag the specification fixes. The broker acknowledges
+    /// nothing at QoS 0, so [`Self::flush`] confirms nothing — read
+    /// [`Self::tracks_delivery`] before you gate a durable write on it.
+    ///
+    /// Pass [`DEFAULT_CONNECT_TIMEOUT`] for the wait [`Self::connect`] uses.
     ///
     /// # Errors
     ///
@@ -114,15 +145,31 @@ impl SparkplugClient {
     /// answer within `timeout`. Returns
     /// [`SparkplugError::InvalidNamespace`] when `config.version` cannot
     /// stand as a topic segment.
-    pub async fn connect_as(
+    pub async fn connect_as_edge_node(
         config: &MqttConfig,
-        role: Role,
+        edge_node: EdgeNode<'_>,
+        timeout: Duration,
+    ) -> Result<Self, SparkplugError> {
+        Self::connect_with(config, Identity::EdgeNode(edge_node.into()), timeout).await
+    }
+
+    /// Open the connection and start the event loop, whichever identity the
+    /// client holds.
+    ///
+    /// Every public constructor runs this body, so they differ in the
+    /// identity alone.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::connect_as_edge_node`].
+    async fn connect_with(
+        config: &MqttConfig,
+        identity: Identity,
         timeout: Duration,
     ) -> Result<Self, SparkplugError> {
         let (async_client, eventloop) = mqtt_parts(config);
 
         let namespace = Namespace::new(&config.version)?;
-        let node_id: Arc<str> = Arc::from(config.node_id.as_str());
 
         let (tx, rx) = oneshot::channel::<()>();
         let delivery = Arc::new(DeliveryTracker::new());
@@ -147,16 +194,36 @@ impl SparkplugClient {
         Ok(Self {
             client: async_client,
             namespace,
-            node_id,
+            identity,
             delivery,
             seq: Arc::new(SeqCounters::new()),
             health,
-            role,
             event_loop_handle,
         })
     }
 
-    /// Publish a single metric as a DDATA message on behalf of `node_id`.
+    /// Which role this client publishes in.
+    ///
+    /// The identity decides it, so an edge node role always has an edge
+    /// node beside it.
+    fn role(&self) -> Role {
+        match self.identity {
+            Identity::Publisher => Role::Publisher,
+            Identity::EdgeNode { .. } => Role::EdgeNode,
+        }
+    }
+
+    /// The edge node this client speaks for, or `None` for a publisher.
+    ///
+    /// The stored pair passed its check where it entered [`OwnedEdgeNode`],
+    /// so this borrows it rather than checking it again — see ADR-0002.
+    fn edge_node(&self) -> Option<EdgeNode<'_>> {
+        match &self.identity {
+            Identity::Publisher => None,
+            Identity::EdgeNode(edge_node) => Some(edge_node.into()),
+        }
+    }
+
     /// The namespace this client publishes on.
     ///
     /// Use it to build topics for [`Self::publish_metric_to`].
@@ -237,8 +304,8 @@ impl SparkplugClient {
 
 /// How long [`SparkplugClient::connect`] waits for the broker to answer.
 ///
-/// Pass this to [`SparkplugClient::connect_as`] to get the same wait that
-/// [`SparkplugClient::connect`] uses.
+/// Pass this to [`SparkplugClient::connect_as_edge_node`] to get the same
+/// wait that [`SparkplugClient::connect`] uses.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]

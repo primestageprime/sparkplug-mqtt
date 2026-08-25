@@ -24,11 +24,11 @@ fn seq_counts(requests: &flume::Receiver<rumqttc::Request>) -> Vec<u64> {
 ///
 /// The metric carries no meaning here. These tests read the `seq` of each
 /// message, and the count follows the topic alone.
-async fn publish_one(client: &SparkplugClient, group_id: &str, node_id: &str) {
+async fn publish_one(client: &SparkplugClient, group_id: &str, edge_node_id: &str) {
     client
         .publish_metric(
             group_id,
-            node_id,
+            edge_node_id,
             "pump_3",
             "temperature",
             MetricValue::Float(1.0),
@@ -40,15 +40,15 @@ async fn publish_one(client: &SparkplugClient, group_id: &str, node_id: &str) {
 
 #[tokio::test]
 async fn nbirth_sets_the_count_back_to_zero() {
-    let (client, requests) = wired(Role::Publisher);
+    // `publish_birth` announces the edge node the client took at connect,
+    // so only an edge node client can call it.
+    let (client, requests) = wired_edge_node(edge_node_named("PlantFloor", "edge1"));
 
-    // `wired` names "edge1", and `publish_birth` uses that edge node, so
-    // the data and the births share one count.
     publish_one(&client, "PlantFloor", "edge1").await;
     publish_one(&client, "PlantFloor", "edge1").await;
 
     client
-        .publish_birth("PlantFloor", "pump_3")
+        .publish_birth(DeviceId::new("pump_3").expect("device id"))
         .await
         .expect("the births must be accepted");
 
@@ -61,7 +61,7 @@ async fn nbirth_sets_the_count_back_to_zero() {
 
 #[tokio::test]
 async fn an_nbirth_on_a_caller_built_topic_sets_the_count_back_to_zero() {
-    let (client, requests) = wired(Role::Publisher);
+    let (client, requests) = wired_publisher();
 
     publish_one(&client, "PlantFloor", "edge1").await;
     publish_one(&client, "PlantFloor", "edge1").await;
@@ -89,10 +89,10 @@ async fn an_nbirth_on_a_caller_built_topic_sets_the_count_back_to_zero() {
 
 #[tokio::test]
 async fn two_edge_nodes_keep_separate_counts() {
-    let (client, requests) = wired(Role::Publisher);
+    let (client, requests) = wired_publisher();
 
-    for node_id in ["edge1", "edge2", "edge1", "edge2"] {
-        publish_one(&client, "PlantFloor", node_id).await;
+    for edge_node_id in ["edge1", "edge2", "edge1", "edge2"] {
+        publish_one(&client, "PlantFloor", edge_node_id).await;
     }
 
     // One client publishes for many edge nodes, and each edge node keeps
@@ -101,8 +101,8 @@ async fn two_edge_nodes_keep_separate_counts() {
 }
 
 #[tokio::test]
-async fn one_node_id_in_two_groups_keeps_separate_counts() {
-    let (client, requests) = wired(Role::Publisher);
+async fn one_edge_node_id_in_two_groups_keeps_separate_counts() {
+    let (client, requests) = wired_publisher();
 
     for group_id in ["PlantFloor", "Boiler", "PlantFloor", "Boiler"] {
         publish_one(&client, group_id, "edge1").await;
@@ -116,7 +116,7 @@ async fn one_node_id_in_two_groups_keeps_separate_counts() {
 
 #[tokio::test]
 async fn a_metric_on_a_host_topic_is_refused() {
-    let (client, requests) = wired(Role::Publisher);
+    let (client, requests) = wired_publisher();
     let topic = client
         .namespace()
         .state(HostId::new("scada_1").expect("host id"));
@@ -132,5 +132,29 @@ async fn a_metric_on_a_host_topic_is_refused() {
     assert!(
         seq_counts(&requests).is_empty(),
         "a refused publish must reach no wire"
+    );
+}
+
+#[tokio::test]
+async fn a_birth_and_the_data_for_that_edge_node_share_one_count() {
+    // The defect this closes: the births named the edge node of the
+    // connection, and the data named the edge node of the call. Where the
+    // two differed, they counted apart, and a host application read a gap in
+    // both streams. One identity now feeds both.
+    let (client, requests) = wired_edge_node(edge_node_named("PlantFloor", "edge1"));
+
+    client
+        .publish_birth(DeviceId::new("pump_3").expect("device id"))
+        .await
+        .expect("the births must be accepted");
+
+    publish_one(&client, "PlantFloor", "edge1").await;
+
+    // The NBIRTH sets the count of `PlantFloor/edge1` back to 0, the DBIRTH
+    // beside it carries 1, and the DDATA for that edge node carries 2.
+    assert_eq!(
+        seq_counts(&requests),
+        vec![0, 1, 2],
+        "the births and the data of one edge node must draw from one count"
     );
 }
